@@ -1,0 +1,25 @@
+[profile.default]
+src = "src"
+test = "test"
+out = "out"
+libs = ["lib"]
+
+solc = "0.8.26"
+evm_version = "cancun"
+optimizer = true
+optimizer_runs = 200
+
+# 這個專案刻意維持零外部依賴，只用 forge-std。
+# ERC-20 的安全包裝（SafeERC20 之類）留到 Day 17 再談，現在要先讓陷阱裸露出來。
+remappings = ["forge-std/=lib/forge-std/src/"]
+
+[lint]
+# ERC-20 規定 name / symbol / decimals 必須是這三個小寫名稱，不能改成 SCREAMING_SNAKE_CASE，
+# 否則 ABI 對不上、所有錢包與 indexer 都讀不到。mock 也不需要為了省 code size 去拆 modifier。
+exclude_lints = ["screaming-snake-case-const", "screaming-snake-case-immutable", "unwrapped-modifier-logic"]
+
+[fuzz]
+runs = 512
+
+[fmt]
+line_length = 120
