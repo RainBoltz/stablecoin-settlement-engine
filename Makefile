@@ -1,4 +1,4 @@
-.PHONY: help test evm-build evm-test evm-test-fork go-test devnet devnet-down devnet-reset devnet-seed devnet-status devnet-logs
+.PHONY: help test evm-build evm-test evm-test-fork go-test api-run devnet devnet-down devnet-reset devnet-seed devnet-status devnet-logs
 
 help:
 	@echo "make test            everything that runs offline: evm-test + go-test"
@@ -6,6 +6,7 @@ help:
 	@echo "make evm-test        run the offline Solidity test suite (fork tests are skipped)"
 	@echo "make evm-test-fork   run the mainnet-fork tests; needs ETH_RPC_URL"
 	@echo "make go-test         vet + test the Go backend (backend/)"
+	@echo "make api-run         start the Payment API on 127.0.0.1:8080 (memory stores, no chain)"
 	@echo "make devnet          start anvil + deploy + seed (idempotent, state persists in .devnet/)"
 	@echo "make devnet-down     stop anvil, dump state"
 	@echo "make devnet-reset    stop, wipe state and deployments"
@@ -27,6 +28,9 @@ evm-test-fork:
 
 go-test:
 	cd backend && go vet ./... && go test ./...
+
+api-run:
+	cd backend && go run ./cmd/api
 
 devnet:
 	@scripts/devnet.sh up

@@ -4,7 +4,8 @@ Move money exactly once. A multichain stablecoin settlement engine.
 ## Repository layout
 
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
-Only the EVM contracts, the local devnet tooling and the Payment Intent state machine exist so far;
+Only the EVM contracts, the local devnet tooling, the Payment Intent state machine and the first
+slice of the Payment API (create / get an intent, behind an idempotency layer) exist so far;
 the relayer and the non-EVM chains land in their own directories as the series progresses.
 
 ```
@@ -12,15 +13,25 @@ Makefile                          # Entry points: make test, make devnet, make e
 scripts/
 └── devnet.sh                     # Local devnet lifecycle: up / down / reset / seed / status
 backend/                          # Go module (stdlib only so far), go 1.24
+├── cmd/
+│   └── api/                      # `make api-run`: the Payment API on memory stores, for curl
 └── internal/
-    └── intent/                   # Payment Intent state machine: states, actors, transition table, CAS store
-        ├── state.go              # State / Actor / Rule and the transition table (Rules())
-        ├── intent.go             # Intent, Transition (history entry), New()
-        ├── machine.go            # Apply(): replay is a no-op, terminal is absorbing, actor + evidence checks
-        ├── store.go              # Store interface (compare-and-swap Save), MemoryStore, Advance()
-        ├── table.go              # Table(): the transition table as text, pinned by the golden test
-        ├── testdata/transitions.golden
-        └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, Example_lifecycle
+    ├── intent/                   # Payment Intent state machine: states, actors, transition table, CAS store
+    │   ├── state.go              # State / Actor / Rule and the transition table (Rules())
+    │   ├── intent.go             # Intent, Transition (history entry), New()
+    │   ├── machine.go            # Apply(): replay is a no-op, terminal is absorbing, actor + evidence checks
+    │   ├── store.go              # Store interface (compare-and-swap Save), MemoryStore, Advance()
+    │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
+    │   ├── testdata/transitions.golden
+    │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, Example_lifecycle
+    ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
+    │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
+    │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
+    │   ├── handler.go            # http middleware: 400 / 401 / 409 / 422, replay with Idempotent-Replayed
+    │   └── *_test.go             # Key_*, Fingerprint_*, MemoryStore_*, Handler_*
+    └── api/                      # Payment API: POST /v1/payment_intents (idempotent), GET /v1/payment_intents/{id}
+        ├── api.go                # routes, request/response shapes, NewIntentID
+        └── *_test.go             # CreateIntent_*, GetIntent_*, Example_retryStorm
 contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
@@ -62,6 +73,7 @@ git submodule update --init --recursive     # forge-std is a git submodule
 make test            # everything that runs offline: evm-test + go-test
 make evm-test        # Solidity suite; the mainnet-fork tests are skipped
 make go-test         # go vet + go test for backend/
+make api-run         # Payment API on http://127.0.0.1:8080, memory stores, no chain
 make devnet          # start anvil, deploy the Token Zoo, seed balances; state persists in .devnet/
 make devnet-status   # who has what
 make devnet-down     # stop anvil (state is dumped to .devnet/anvil-state.json)
@@ -71,6 +83,12 @@ make devnet-reset    # wipe state and deployments; the next `make devnet` starts
 Deployed addresses land in `contracts/evm/deployments/31337.json`. To run the mainnet-fork
 faithfulness tests: `ETH_RPC_URL=https://... make evm-test-fork`. Useful variants:
 `forge test -vvvv` inside `contracts/evm` to see full call traces, and `forge fmt` before committing.
+
+The Payment API requires `Authorization: Bearer <token>` (the token is the idempotency scope; there is
+no real authentication yet) and an `Idempotency-Key` header on every `POST`. Same key + same body replays
+the first answer with `Idempotent-Replayed: true`; same key + different body is a `422`; a retry that
+lands while the first request is still running is a `409`. Keys live 24 hours.
+`go test ./internal/api -run Example -v` shows the retry storm end to end.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
