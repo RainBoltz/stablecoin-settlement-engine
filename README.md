@@ -3,10 +3,13 @@ Move money exactly once. A multichain stablecoin settlement engine.
 
 ## Repository layout
 
-The repository is a monorepo. Only the EVM contracts exist so far; the relayer and the
-non-EVM chains land in their own directories as the series progresses.
+The repository is a monorepo. Only the EVM contracts and the local devnet tooling exist so
+far; the relayer and the non-EVM chains land in their own directories as the series progresses.
 
 ```
+Makefile                          # Entry points: make devnet, make evm-test, ...
+scripts/
+└── devnet.sh                     # Local devnet lifecycle: up / down / reset / seed / status
 contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
@@ -18,33 +21,42 @@ contracts/
     │       ├── USDTMock.sol              # No return value, approve race lock, fee, blacklist, pause
     │       ├── NoRevertERC20Mock.sol     # Returns false instead of reverting
     │       └── FeeOnTransferERC20Mock.sol# Recipient always receives less than was sent
+    ├── script/
+    │   ├── DevnetAccounts.sol    # The cast: deployer / payer / merchant / relayer / blacklisted
+    │   ├── TokenZooBase.sol      # deploy() + seed() + deployments json, no run(); tests inherit it
+    │   ├── DeployTokenZoo.s.sol  # run(): broadcast the deployment, write deployments/<chainId>.json
+    │   └── SeedDevnet.s.sol      # run(): read the json, broadcast the world state
+    ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
     └── test/
-        └── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
+        ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
+        ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
+        └── fork/
+            └── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
 ```
 
 The mocks live under `src/` rather than `test/` on purpose: the devnet deployment scripts
 and the relayer integration tests reuse them.
 
-## Running the EVM tests
+## Quick start
 
-Install [Foundry](https://getfoundry.sh) if you do not have it:
+Requires [Foundry](https://getfoundry.sh) >= 1.3.0 (`anvil_dealERC20` was added there) and `jq`.
 
 ```bash
 curl -L https://foundry.paradigm.xyz | bash && foundryup
+git submodule update --init --recursive     # forge-std is a git submodule
 ```
-
-`forge-std` is a git submodule, so fetch it after cloning:
 
 ```bash
-git submodule update --init --recursive
+make evm-test        # offline test suite; the mainnet-fork tests are skipped
+make devnet          # start anvil, deploy the Token Zoo, seed balances; state persists in .devnet/
+make devnet-status   # who has what
+make devnet-down     # stop anvil (state is dumped to .devnet/anvil-state.json)
+make devnet-reset    # wipe state and deployments; the next `make devnet` starts from genesis
 ```
 
-Then run the test suite:
+Deployed addresses land in `contracts/evm/deployments/31337.json`. To run the mainnet-fork
+faithfulness tests: `ETH_RPC_URL=https://... make evm-test-fork`. Useful variants:
+`forge test -vvvv` inside `contracts/evm` to see full call traces, and `forge fmt` before committing.
 
-```bash
-cd contracts/evm
-forge test
-```
-
-Useful variants: `forge test -vvvv` to see the full call traces (handy for the USDT
-return-data failure), and `forge fmt` before committing.
+Everything under `make devnet` uses Anvil's default mnemonic. Those keys are public; never point
+the scripts at a real network.
