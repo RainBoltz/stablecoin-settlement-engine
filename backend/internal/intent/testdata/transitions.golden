@@ -1,0 +1,15 @@
+FROM          TO            BY                       NEEDS
+created       authorized    api                      -
+created       canceled      api,operator,system      reason
+authorized    settling      relayer                  -
+authorized    canceled      api,operator             reason
+settling      confirming    relayer,listener         tx_hash
+settling      failed        relayer                  reason
+settling      needs_review  relayer                  reason
+confirming    settled       listener                 tx_hash
+confirming    settling      listener                 reason
+confirming    needs_review  listener                 reason
+needs_review  settled       operator                 tx_hash,reason
+needs_review  failed        operator                 reason
+
+terminal: settled, failed, canceled
