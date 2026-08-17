@@ -1,6 +1,7 @@
 [profile.default]
 src = "src"
 test = "test"
+script = "script"
 out = "out"
 libs = ["lib"]
 
@@ -12,6 +13,16 @@ optimizer_runs = 200
 # 這個專案刻意維持零外部依賴，只用 forge-std。
 # ERC-20 的安全包裝（SafeERC20 之類）留到 Day 17 再談，現在要先讓陷阱裸露出來。
 remappings = ["forge-std/=lib/forge-std/src/"]
+
+# Day 3：部署腳本會把地址寫進 deployments/<chainId>.json。
+# 只對這一個目錄開讀寫，腳本與測試碰不到專案裡的其他檔案。
+fs_permissions = [{ access = "read-write", path = "./deployments" }]
+
+[rpc_endpoints]
+# forge script / forge test 可以用別名代替 URL：--rpc-url anvil
+anvil = "http://127.0.0.1:8545"
+# fork 測試用；沒設環境變數時這個別名不會被解析，離線跑測試不受影響
+mainnet = "${ETH_RPC_URL}"
 
 [lint]
 # ERC-20 規定 name / symbol / decimals 必須是這三個小寫名稱，不能改成 SCREAMING_SNAKE_CASE，
