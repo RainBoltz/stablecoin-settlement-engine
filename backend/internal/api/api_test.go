@@ -13,6 +13,7 @@ import (
 
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/idempotency"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
 )
 
 var t0 = time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
@@ -49,6 +50,13 @@ func (f *fixture) post(key, scope, body string) *httptest.ResponseRecorder {
 
 func (f *fixture) get(id string) *httptest.ResponseRecorder {
 	req := httptest.NewRequest(http.MethodGet, "/v1/payment_intents/"+id, nil)
+	rr := httptest.NewRecorder()
+	f.h.ServeHTTP(rr, req)
+	return rr
+}
+
+func (f *fixture) trace(ref string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/v1/payment_refs/"+ref, nil)
 	rr := httptest.NewRecorder()
 	f.h.ServeHTTP(rr, req)
 	return rr
@@ -272,5 +280,82 @@ func TestNewIntentID_Shape(t *testing.T) {
 			t.Fatalf("bad id %q", id)
 		}
 		seen[id] = true
+	}
+}
+
+// TestCreateIntent_ResponseCarriesRef：201 的 body 帶 ref，而且就是用回應裡那幾個欄位算出來的；
+// store 裡那筆的 Ref 相同；金額不同的兩筆 intent，ref 不同。客戶端拿到 ref 之後就能自己對鏈上。
+func TestCreateIntent_ResponseCarriesRef(t *testing.T) {
+	f := newFixture(t)
+	got := decodeIntent(t, f.post("order-1001", "merchant-demo", goodBody))
+	ref, err := paymentref.Parse(got.Ref)
+	if err != nil {
+		t.Fatalf("ref %q: %v", got.Ref, err)
+	}
+	want := paymentref.Derive(paymentref.Terms{
+		IntentID: got.ID, Chain: got.Chain, Token: got.Token, Payer: got.Payer, Merchant: got.Merchant, Amount: got.Amount,
+	})
+	if ref != want {
+		t.Fatalf("ref %s is not derived from the response terms (want %s)", ref, want)
+	}
+	stored, _ := f.intents.Get(context.Background(), got.ID)
+	if stored.Ref != ref {
+		t.Fatalf("stored ref %s != response ref %s", stored.Ref, ref)
+	}
+	other := decodeIntent(t, f.post("order-1002", "merchant-demo", strings.Replace(goodBody, `"100000000"`, `"999000000"`, 1)))
+	if other.Ref == got.Ref {
+		t.Fatal("different amount must give a different ref")
+	}
+}
+
+// TestTraceRef_ReturnsIntentAndHistory：intent 走到 confirming 之後，拿 ref 反查得到同一筆、
+// History 有三步、最後一步帶 tx hash。這是 listener 從鏈上撈到 ref 之後要走的路。
+func TestTraceRef_ReturnsIntentAndHistory(t *testing.T) {
+	f := newFixture(t)
+	created := decodeIntent(t, f.post("order-1001", "merchant-demo", goodBody))
+	ctx := context.Background()
+	steps := []intent.Request{
+		{To: intent.StateAuthorized, By: intent.ActorAPI, At: t0.Add(time.Minute)},
+		{To: intent.StateSettling, By: intent.ActorRelayer, At: t0.Add(2 * time.Minute)},
+		{To: intent.StateConfirming, By: intent.ActorRelayer, TxHash: "0xaa", At: t0.Add(3 * time.Minute)},
+	}
+	for _, st := range steps {
+		if _, _, err := intent.Advance(ctx, f.intents, created.ID, st); err != nil {
+			t.Fatal(err)
+		}
+	}
+	rr := f.trace(created.Ref)
+	if rr.Code != 200 {
+		t.Fatalf("trace: %d %s", rr.Code, rr.Body.String())
+	}
+	var out TraceResponse
+	if err := json.Unmarshal(rr.Body.Bytes(), &out); err != nil {
+		t.Fatal(err)
+	}
+	if out.Ref != created.Ref || out.Intent.ID != created.ID || out.Intent.State != "confirming" || out.Intent.Version != 4 {
+		t.Fatalf("trace body: %+v", out)
+	}
+	if len(out.History) != 3 || out.History[2].TxHash != "0xaa" || out.History[2].By != "relayer" {
+		t.Fatalf("history: %+v", out.History)
+	}
+}
+
+// TestTraceRef_RejectsMalformedRef：不是 0x 加 64 個 hex 的東西不是 ref，400；拿 intent id 來查也是 400。
+func TestTraceRef_RejectsMalformedRef(t *testing.T) {
+	f := newFixture(t)
+	created := decodeIntent(t, f.post("order-1001", "merchant-demo", goodBody))
+	for _, bad := range []string{created.ID, strings.TrimPrefix(created.Ref, "0x"), created.Ref[:20], "0x" + strings.Repeat("zz", 32)} {
+		if rr := f.trace(bad); rr.Code != 400 || decodeError(t, rr).Error != "invalid_ref" {
+			t.Errorf("%q: %d %s", bad, rr.Code, rr.Body.String())
+		}
+	}
+}
+
+// TestTraceRef_UnknownRefIs404：格式對、但沒有這筆，404。
+func TestTraceRef_UnknownRefIs404(t *testing.T) {
+	f := newFixture(t)
+	unknown := paymentref.Derive(paymentref.Terms{IntentID: "pi_nope"}).String()
+	if rr := f.trace(unknown); rr.Code != 404 || decodeError(t, rr).Error != "not_found" {
+		t.Fatalf("unknown ref: %d %s", rr.Code, rr.Body.String())
 	}
 }

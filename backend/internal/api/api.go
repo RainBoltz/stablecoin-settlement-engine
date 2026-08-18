@@ -1,4 +1,4 @@
-// Package api 是對外的 Payment API。今天只有兩條路：建立一筆 Payment Intent、查一筆 Payment Intent。
+// Package api 是對外的 Payment API。三條路：建立一筆 Payment Intent、用 id 查一筆、用 PaymentRef 反查一筆。
 //
 // 建立這條路包在 idempotency.Handler 後面：同一個 merchant 用同一個 Idempotency-Key 送幾次，
 // 都只會長出一筆 intent、拿到同一份回應。API 本身不知道自己被去重了，它每次被叫到都老實地建一筆；
@@ -14,10 +14,12 @@ import (
 	"fmt"
 	"math/big"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/idempotency"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
 )
 
 // Server 把兩個 store 與一個時鐘綁在一起。
@@ -51,6 +53,9 @@ func New(intents intent.Store, idem idempotency.Store, opts ...Option) http.Hand
 	create := idempotency.Handler(idempotency.Options{Store: idem, Policy: s.policy, Now: s.now}, http.HandlerFunc(s.createIntent))
 	mux.Handle("POST /v1/payment_intents", create)
 	mux.HandleFunc("GET /v1/payment_intents/{id}", s.getIntent)
+	// 反查入口：手上只有鏈上撈到的 ref、沒有 id 的人（listener、對帳、稽核工具）從這裡回到 intent。
+	// 它回的比 GET by id 多一份 History，因為反查的人要的就是「這筆錢怎麼走到鏈上的」。
+	mux.HandleFunc("GET /v1/payment_refs/{ref}", s.traceRef)
 	return mux
 }
 
@@ -81,8 +86,11 @@ type CreateIntentRequest struct {
 }
 
 // IntentResponse 是對外的 intent 形狀。欄位比 intent.Intent 少：History、UpdatedAt 這些是內部的事。
+//
+// Ref 一建立就回給客戶端：之後客戶端在鏈上看到這 32 bytes，不用問我們就知道是哪一筆。
 type IntentResponse struct {
 	ID        string    `json:"id"`
+	Ref       string    `json:"ref"`
 	Chain     string    `json:"chain"`
 	Token     string    `json:"token"`
 	Payer     string    `json:"payer"`
@@ -96,7 +104,7 @@ type IntentResponse struct {
 
 func toResponse(it *intent.Intent) IntentResponse {
 	return IntentResponse{
-		ID: it.ID, Chain: it.Chain, Token: it.Token, Payer: it.Payer, Merchant: it.Merchant,
+		ID: it.ID, Ref: it.Ref.String(), Chain: it.Chain, Token: it.Token, Payer: it.Payer, Merchant: it.Merchant,
 		Amount: it.Amount.String(), State: string(it.State), Version: it.Version,
 		CreatedAt: it.CreatedAt, ExpiresAt: it.ExpiresAt,
 	}
@@ -154,6 +162,53 @@ func (s *Server) getIntent(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, toResponse(it))
 }
 
+// TransitionResponse 是 History 裡的一步，對外的形狀。
+type TransitionResponse struct {
+	From   string    `json:"from"`
+	To     string    `json:"to"`
+	By     string    `json:"by"`
+	At     time.Time `json:"at"`
+	TxHash string    `json:"tx_hash,omitempty"`
+	Reason string    `json:"reason,omitempty"`
+}
+
+// TraceResponse 是 GET /v1/payment_refs/{ref} 的回應：從一個 ref 回到 intent，再攤開它走過的每一步。
+// 這就是「任何一筆錢都能從鏈上反查回最初那個 API request」的最後一哩：ref → intent → History 裡的每個 tx hash。
+type TraceResponse struct {
+	Ref     string               `json:"ref"`
+	Intent  IntentResponse       `json:"intent"`
+	History []TransitionResponse `json:"history"`
+}
+
+func toTrace(it *intent.Intent) TraceResponse {
+	out := TraceResponse{Ref: it.Ref.String(), Intent: toResponse(it), History: make([]TransitionResponse, 0, len(it.History))}
+	for _, h := range it.History {
+		out.History = append(out.History, TransitionResponse{
+			From: string(h.From), To: string(h.To), By: string(h.By), At: h.At, TxHash: h.TxHash, Reason: h.Reason,
+		})
+	}
+	return out
+}
+
+// traceRef 用 ref 反查。ref 格式不對是 400（那不是一把 ref），格式對但沒這筆是 404。
+func (s *Server) traceRef(w http.ResponseWriter, r *http.Request) {
+	ref, err := paymentref.Parse(r.PathValue("ref"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_ref", err.Error())
+		return
+	}
+	it, err := s.intents.GetByRef(r.Context(), ref)
+	if err != nil {
+		if errors.Is(err, intent.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "not_found", err.Error())
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "internal", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, toTrace(it))
+}
+
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(status)
@@ -167,4 +222,16 @@ func writeError(w http.ResponseWriter, status int, code, detail string) {
 // String 讓 IntentResponse 在 Example 裡印成一行。
 func (r IntentResponse) String() string {
 	return fmt.Sprintf("%s %s v%d %s %s", r.ID, r.State, r.Version, r.Amount, r.Merchant)
+}
+
+// String 讓 TransitionResponse 在 Example 裡印成一行，格式跟 intent.Transition 一樣。
+func (t TransitionResponse) String() string {
+	s := fmt.Sprintf("%-12s -> %-12s by %-8s", t.From, t.To, t.By)
+	if t.TxHash != "" {
+		s += "  tx " + t.TxHash
+	}
+	if t.Reason != "" {
+		s += "  (" + t.Reason + ")"
+	}
+	return strings.TrimRight(s, " ")
 }
