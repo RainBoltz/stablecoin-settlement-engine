@@ -6,16 +6,23 @@ import (
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
 )
 
 // Intent 是一筆付款在鏈下的代表。它從 API 收到請求那一刻誕生，之後每一層
 // （queue、relayer、listener）都只是在它身上蓋章，不會各自另開一份紀錄。
 //
-// 欄位刻意少：今天只放狀態機需要的東西。金額、token、雙方地址是「這筆付款是什麼」，
-// 狀態、版本、歷程是「它走到哪了」。ID 先當成一個不透明字串，它跟 API 層的去重鍵
-// 以及貫穿鏈上鏈下的追蹤鍵是什麼關係，之後會專門討論。
+// 欄位刻意少：金額、token、雙方地址是「這筆付款是什麼」，狀態、版本、歷程是「它走到哪了」。
+//
+// 一筆 intent 身上有兩個識別碼：ID 是伺服器產生的不透明字串（pi_…），鏈下每一層拿它找資料；
+// Ref 是從 ID 與付款條件推導出來的 32 bytes（見 paymentref），唯一會跟著交易上鏈的那個。
+// API 層的去重鍵（Idempotency Key）不在這裡：它只活在 API 邊界，intent 落地之後就用不到了。
 type Intent struct {
 	ID string
+	// Ref 是這筆付款的 PaymentRef，New 的時候從 Terms 算出來，之後永遠不變。
+	// Store 存檔時會重算一次核對，所以拿到一筆 intent 就能確定它的條件從落地到現在沒被動過。
+	Ref paymentref.Ref
 
 	// Chain 用「協定:網路」表示，例如 evm:31337。之後多鏈時 adapter 靠它分派。
 	Chain string
@@ -99,7 +106,7 @@ func New(spec Spec, now time.Time) (*Intent, error) {
 	case !spec.ExpiresAt.IsZero() && !spec.ExpiresAt.After(now):
 		return nil, fmt.Errorf("%w: expiresAt must be in the future", ErrInvalidSpec)
 	}
-	return &Intent{
+	it := &Intent{
 		ID:        spec.ID,
 		Chain:     spec.Chain,
 		Token:     spec.Token,
@@ -111,7 +118,22 @@ func New(spec Spec, now time.Time) (*Intent, error) {
 		CreatedAt: now,
 		UpdatedAt: now,
 		ExpiresAt: spec.ExpiresAt,
-	}, nil
+	}
+	// ref 在落地那一刻就有，早於任何交易存在。所以 ledger 與 queue 在錢動之前就拿得到它，
+	// 不用等 tx hash；而 tx hash 之後可能有好幾個（重送、reorg），ref 只有一個。
+	it.Ref = paymentref.Derive(it.Terms())
+	return it, nil
+}
+
+// Terms 是這筆 intent 被 commit 進 PaymentRef 的那幾個欄位。只有「這筆付款是什麼」，沒有「走到哪了」。
+func (it *Intent) Terms() paymentref.Terms {
+	amount := ""
+	if it.Amount != nil {
+		amount = it.Amount.String()
+	}
+	return paymentref.Terms{
+		IntentID: it.ID, Chain: it.Chain, Token: it.Token, Payer: it.Payer, Merchant: it.Merchant, Amount: amount,
+	}
 }
 
 // Clone 回傳一份深拷貝。Store 進出都用拷貝，避免呼叫端拿著指標繞過 Apply 改狀態。

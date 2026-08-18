@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
 )
 
 var (
@@ -13,6 +15,9 @@ var (
 	// ErrVersionConflict：存檔時發現別人先改過了。這不是 bug，是兩個元件同時想推同一筆 intent
 	// 的正常結果；輸的一方重新讀一次再決定要不要再試。
 	ErrVersionConflict = errors.New("intent: version conflict")
+	// ErrRefMismatch：要存的 intent，它的 Ref 跟從它自己的條件重算出來的不一樣。
+	// 這是 bug 或竄改（有人動了金額、收款人卻沒換 intent），不是競爭；一律拒絕寫入。
+	ErrRefMismatch = errors.New("intent: payment ref does not match the intent terms")
 )
 
 // Store 是 intent 的儲存介面。今天只有記憶體版；換成資料庫時介面不變，
@@ -21,22 +26,29 @@ var (
 // 為什麼堅持 CAS：狀態機本身是純函式，Apply 不知道有沒有別人也在動同一筆 intent。
 // 「先讀、Apply、寫回」這三步如果不是原子的，兩個 relayer worker 各自讀到 authorized、
 // 各自推到 settling、各自廣播，錢就動了兩次。CAS 把這件事變成：只有一個寫得回去。
+//
+// 兩個讀取入口對應兩種呼叫者：鏈下的 API 與 queue 拿 id 來查；從鏈上回來的 listener 與對帳引擎
+// 手上只有 ref，拿 ref 來查。資料庫版本就是 intents 表上多一個 unique index 在 ref 欄位。
 type Store interface {
 	// Get 回傳一份拷貝，改它不會影響存的那份。
 	Get(ctx context.Context, id string) (*Intent, error)
+	// GetByRef 用 PaymentRef 找回 intent，同樣回傳拷貝。這是鏈上世界回到鏈下世界的唯一入口。
+	GetByRef(ctx context.Context, ref paymentref.Ref) (*Intent, error)
 	// Save 只在存的那份 Version 等於 expectedVersion 時寫入；新 intent 用 expectedVersion=0。
+	// 寫入前會用 intent 自己的條件重算 Ref，對不上就是 ErrRefMismatch。
 	Save(ctx context.Context, it *Intent, expectedVersion uint64) error
 }
 
 // MemoryStore 是給測試與本地開發用的 Store。
 type MemoryStore struct {
-	mu sync.Mutex
-	m  map[string]*Intent
+	mu    sync.Mutex
+	m     map[string]*Intent
+	byRef map[paymentref.Ref]string
 }
 
 // NewMemoryStore 建立一個空的 MemoryStore。
 func NewMemoryStore() *MemoryStore {
-	return &MemoryStore{m: make(map[string]*Intent)}
+	return &MemoryStore{m: make(map[string]*Intent), byRef: make(map[paymentref.Ref]string)}
 }
 
 // Get 實作 Store。
@@ -50,7 +62,18 @@ func (s *MemoryStore) Get(_ context.Context, id string) (*Intent, error) {
 	return it.Clone(), nil
 }
 
-// Save 實作 Store。
+// GetByRef 實作 Store。
+func (s *MemoryStore) GetByRef(_ context.Context, ref paymentref.Ref) (*Intent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	id, ok := s.byRef[ref]
+	if !ok {
+		return nil, fmt.Errorf("%w: ref %s", ErrNotFound, ref)
+	}
+	return s.m[id].Clone(), nil
+}
+
+// Save 實作 Store。先做 CAS，再核對 ref：版本衝突是常態、先擋掉便宜；ref 對不上是異常，擋在寫入之前。
 func (s *MemoryStore) Save(_ context.Context, it *Intent, expectedVersion uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -61,7 +84,11 @@ func (s *MemoryStore) Save(_ context.Context, it *Intent, expectedVersion uint64
 	case exists && cur.Version != expectedVersion:
 		return fmt.Errorf("%w: %s is at version %d, expected %d", ErrVersionConflict, it.ID, cur.Version, expectedVersion)
 	}
+	if want := paymentref.Derive(it.Terms()); it.Ref != want {
+		return fmt.Errorf("%w: %s has ref %s, terms derive %s", ErrRefMismatch, it.ID, it.Ref, want)
+	}
 	s.m[it.ID] = it.Clone()
+	s.byRef[it.Ref] = it.ID
 	return nil
 }
 
