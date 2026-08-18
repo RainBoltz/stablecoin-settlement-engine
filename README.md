@@ -5,9 +5,9 @@ Move money exactly once. A multichain stablecoin settlement engine.
 
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
 Only the EVM contracts, the local devnet tooling, the Payment Intent state machine, the PaymentRef
-derivation and the first slice of the Payment API (create / get / trace an intent, behind an
-idempotency layer) exist so far; the relayer and the non-EVM chains land in their own directories
-as the series progresses.
+derivation, the first slice of the Payment API (create / get / trace an intent, behind an
+idempotency layer) and the double-entry ledger exist so far; the relayer and the non-EVM chains land
+in their own directories as the series progresses.
 
 ```
 Makefile                          # Entry points: make test, make devnet, make evm-test, make go-test, ...
@@ -28,6 +28,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
     │   ├── testdata/transitions.golden
     │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, ref_test.go, Example_lifecycle
+    ├── ledger/                   # Double-entry ledger: append-only, hash-chained journal of hold / post / void entries, keyed by PaymentRef
+    │   ├── ledger.go             # Asset, Account (payer: / merchant: / fee:), Leg, Kind, Entry, Validate (legs sum to zero)
+    │   ├── hash.go               # Preimage + sha256 chain: every entry hashes the previous one
+    │   ├── journal.go            # Journal interface (Append only, idempotent by id), MemoryJournal, Balances projection, Verify
+    │   └── *_test.go             # Entry_*, Journal_* (idempotent append, resolve once, pending / posted, pinned chain head, tampering), Example_holdPostVoid
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -100,6 +105,13 @@ Every intent carries a `ref`: `sha256` over a domain tag, the intent id and the 
 (chain, token, payer, merchant, amount), 32 bytes, printed as `0x` + 64 hex. It is the only key that
 goes on-chain; the intent store re-derives it on every save and `GET /v1/payment_refs/{ref}` walks back
 from a ref to the intent and its history. `Example_derive` (`internal/paymentref/example_test.go`) shows one.
+
+The ledger (`internal/ledger`) is double-entry and append-only. Every entry has at least two legs in
+one asset that sum to zero; `hold` reserves the amount before the relayer broadcasts, `post` settles
+with what actually arrived on-chain (a third `fee:` leg absorbs transfer tax), `void` releases a hold
+that will never move money. A hold resolves exactly once, `Append` is idempotent by entry id, pending /
+posted balances are a projection over the journal, and every entry hashes the previous one so `Verify`
+detects any edit. `Example_holdPostVoid` (`internal/ledger/example_test.go`) walks three payments through it.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
