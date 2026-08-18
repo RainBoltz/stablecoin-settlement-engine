@@ -4,9 +4,10 @@ Move money exactly once. A multichain stablecoin settlement engine.
 ## Repository layout
 
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
-Only the EVM contracts, the local devnet tooling, the Payment Intent state machine and the first
-slice of the Payment API (create / get an intent, behind an idempotency layer) exist so far;
-the relayer and the non-EVM chains land in their own directories as the series progresses.
+Only the EVM contracts, the local devnet tooling, the Payment Intent state machine, the PaymentRef
+derivation and the first slice of the Payment API (create / get / trace an intent, behind an
+idempotency layer) exist so far; the relayer and the non-EVM chains land in their own directories
+as the series progresses.
 
 ```
 Makefile                          # Entry points: make test, make devnet, make evm-test, make go-test, ...
@@ -16,22 +17,26 @@ backend/                          # Go module (stdlib only so far), go 1.24
 ├── cmd/
 │   └── api/                      # `make api-run`: the Payment API on memory stores, for curl
 └── internal/
+    ├── paymentref/               # PaymentRef: sha256 commitment over (intent id + payment terms), 32 bytes, goes on-chain
+    │   ├── ref.go                # Terms, Derive, Preimage (length-prefixed), Ref.String / Parse (0x + 64 hex)
+    │   └── *_test.go             # pinned vector, every-field-matters, boundary, parse; Example_derive
     ├── intent/                   # Payment Intent state machine: states, actors, transition table, CAS store
     │   ├── state.go              # State / Actor / Rule and the transition table (Rules())
-    │   ├── intent.go             # Intent, Transition (history entry), New()
+    │   ├── intent.go             # Intent (ID + Ref), Transition (history entry), New() derives the Ref, Terms()
     │   ├── machine.go            # Apply(): replay is a no-op, terminal is absorbing, actor + evidence checks
-    │   ├── store.go              # Store interface (compare-and-swap Save), MemoryStore, Advance()
+    │   ├── store.go              # Store interface (CAS Save that re-derives the Ref, Get, GetByRef), MemoryStore, Advance()
     │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
     │   ├── testdata/transitions.golden
-    │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, Example_lifecycle
+    │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, ref_test.go, Example_lifecycle
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
     │   ├── handler.go            # http middleware: 400 / 401 / 409 / 422, replay with Idempotent-Replayed
     │   └── *_test.go             # Key_*, Fingerprint_*, MemoryStore_*, Handler_*
-    └── api/                      # Payment API: POST /v1/payment_intents (idempotent), GET /v1/payment_intents/{id}
-        ├── api.go                # routes, request/response shapes, NewIntentID
-        └── *_test.go             # CreateIntent_*, GetIntent_*, Example_retryStorm
+    └── api/                      # Payment API: POST /v1/payment_intents (idempotent), GET /v1/payment_intents/{id},
+        │                         #              GET /v1/payment_refs/{ref} (intent + history, for whoever only holds the ref)
+        ├── api.go                # routes, request/response shapes, NewIntentID, TraceResponse
+        └── *_test.go             # CreateIntent_*, GetIntent_*, TraceRef_*, Example_retryStorm, Example_traceByRef
 contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
@@ -88,7 +93,13 @@ The Payment API requires `Authorization: Bearer <token>` (the token is the idemp
 no real authentication yet) and an `Idempotency-Key` header on every `POST`. Same key + same body replays
 the first answer with `Idempotent-Replayed: true`; same key + different body is a `422`; a retry that
 lands while the first request is still running is a `409`. Keys live 24 hours.
-`go test ./internal/api -run Example -v` shows the retry storm end to end.
+`Example_retryStorm` and `Example_traceByRef` (`internal/api/example_test.go`) walk through the retry storm
+and a trace-by-ref end to end; `go test ./internal/api -run Example -v` runs them.
+
+Every intent carries a `ref`: `sha256` over a domain tag, the intent id and the payment terms
+(chain, token, payer, merchant, amount), 32 bytes, printed as `0x` + 64 hex. It is the only key that
+goes on-chain; the intent store re-derives it on every save and `GET /v1/payment_refs/{ref}` walks back
+from a ref to the intent and its history. `Example_derive` (`internal/paymentref/example_test.go`) shows one.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
