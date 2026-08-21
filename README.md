@@ -6,9 +6,10 @@ Move money exactly once. A multichain stablecoin settlement engine.
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
 Only the EVM contracts, the local devnet tooling, the Payment Intent state machine, the PaymentRef
 derivation, the first slice of the Payment API (create / get / trace an intent, behind an
-idempotency layer), the double-entry ledger, the job queue and the first slice of the relayer (a
-single worker that takes an authorized intent to `confirming` through a fake sender) exist so far;
-the real chain senders and the non-EVM chains land in their own directories as the series progresses.
+idempotency layer), the double-entry ledger, the job queue and the relayer worker pool (N workers
+over one queue, graceful drain, a throttle in front of the sender; the sender itself is still a fake)
+exist so far; the real chain senders and the non-EVM chains land in their own directories as the
+series progresses.
 
 ```
 Makefile                          # Entry points: make test, make devnet, make evm-test, make go-test, ...
@@ -40,7 +41,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   └── *_test.go             # Job_Validate, MemoryQueue_* (idempotent enqueue, lease hides, stale receipt, nack delay, concurrency), Example_leaseAckNack
     ├── relayer/                  # Relayer worker: lease a job, read the intent, settling -> hold -> send -> confirming, ack last
     │   ├── relayer.go            # Sender interface, Worker (RunOnce / Run), Outcome (sent / no-op / retry / needs_review), Config, process()
-    │   └── *_test.go             # Worker_* (order pinned, redelivery no-op, lease takeover, send failure -> retry -> review, lost CAS, many workers), Example_settleThroughQueue
+    │   ├── throttle.go           # Limiter interface (acquired before any side effect), Throttle: max in-flight semaphore + per-second token bucket
+    │   ├── pool.go               # Pool: N goroutines over one Worker, pull not push, two-phase drain (stop leasing, wait, then abandon), panic containment, Stats
+    │   └── *_test.go             # Worker_* (order pinned, redelivery no-op, lease takeover, send failure -> retry -> review, lost CAS, many workers, throttled job untouched),
+    │                             # Throttle_* (in-flight cap, per-second spacing, burst, refund on cancel), Pool_* (drain, drain timeout, panic, many workers throttled),
+    │                             # Example_settleThroughQueue, Example_poolDrain, Example_throttle
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -131,6 +136,15 @@ redelivered job that finds the intent already in `settling` without a tx hash do
 tell whether the previous broadcast left the building): it waits while the intent is young and pushes it
 to `needs_review` after `StuckAfter`. There is no real chain sender yet; `Example_settleThroughQueue`
 (`internal/relayer/example_test.go`) walks a normal job, a lease takeover and a send failure through it.
+
+`Pool` runs N of those workers over the same queue. Each goroutine leases for itself (the queue is the
+channel; there is no dispatcher), shutdown is two-phase (the context ending stops leasing, in-flight
+jobs finish on a separate context, `DrainTimeout` later whatever is still in flight is abandoned and
+counted in `Stats.Abandoned`), and a panic in one job is contained without acking it. `Throttle` sits
+in front of the worker, not inside the sender: a job that cannot get a send slot goes back to the queue
+untouched (still `authorized`, no `hold`), because a job throttled after `settling` could not be resent.
+It caps sends in flight (a semaphore) and sends per second (a token bucket), both stdlib-only.
+`Example_poolDrain` and `Example_throttle` (`internal/relayer/example_pool_test.go`) show both.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
