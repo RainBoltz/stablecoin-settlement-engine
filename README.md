@@ -6,8 +6,9 @@ Move money exactly once. A multichain stablecoin settlement engine.
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
 Only the EVM contracts, the local devnet tooling, the Payment Intent state machine, the PaymentRef
 derivation, the first slice of the Payment API (create / get / trace an intent, behind an
-idempotency layer) and the double-entry ledger exist so far; the relayer and the non-EVM chains land
-in their own directories as the series progresses.
+idempotency layer), the double-entry ledger, the job queue and the first slice of the relayer (a
+single worker that takes an authorized intent to `confirming` through a fake sender) exist so far;
+the real chain senders and the non-EVM chains land in their own directories as the series progresses.
 
 ```
 Makefile                          # Entry points: make test, make devnet, make evm-test, make go-test, ...
@@ -33,6 +34,13 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── hash.go               # Preimage + sha256 chain: every entry hashes the previous one
     │   ├── journal.go            # Journal interface (Append only, idempotent by id), MemoryJournal, Balances projection, Verify
     │   └── *_test.go             # Entry_*, Journal_* (idempotent append, resolve once, pending / posted, pinned chain head, tampering), Example_holdPostVoid
+    ├── queue/                    # Job queue: at-least-once, lease (visibility timeout), receipt, ack / nack; jobs carry only intent id + ref
+    │   ├── queue.go              # Job (id = <intent id>/settle), Delivery, Receipt, Queue interface, errors
+    │   ├── memory.go             # MemoryQueue: FIFO among visible jobs, idempotent enqueue while pending, attempt counter
+    │   └── *_test.go             # Job_Validate, MemoryQueue_* (idempotent enqueue, lease hides, stale receipt, nack delay, concurrency), Example_leaseAckNack
+    ├── relayer/                  # Relayer worker: lease a job, read the intent, settling -> hold -> send -> confirming, ack last
+    │   ├── relayer.go            # Sender interface, Worker (RunOnce / Run), Outcome (sent / no-op / retry / needs_review), Config, process()
+    │   └── *_test.go             # Worker_* (order pinned, redelivery no-op, lease takeover, send failure -> retry -> review, lost CAS, many workers), Example_settleThroughQueue
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -112,6 +120,17 @@ with what actually arrived on-chain (a third `fee:` leg absorbs transfer tax), `
 that will never move money. A hold resolves exactly once, `Append` is idempotent by entry id, pending /
 posted balances are a projection over the journal, and every entry hashes the previous one so `Verify`
 detects any edit. `Example_holdPostVoid` (`internal/ledger/example_test.go`) walks three payments through it.
+
+The relayer side starts with two packages. `internal/queue` is an at-least-once job queue in the shape
+of SQS: `Enqueue` is idempotent by job id while the job is pending, `Lease` hides a job for a lease
+period and hands out a receipt, `Ack` / `Nack` require the current receipt (a worker that lost its lease
+gets `ErrStaleReceipt`), and a job carries only the intent id and ref, never the payload. `internal/relayer`
+is one worker loop over that queue: read the intent, CAS it to `settling`, append the ledger `hold`, call
+the `Sender`, CAS to `confirming`, ack last. Every step is idempotent, so redelivery is harmless; a
+redelivered job that finds the intent already in `settling` without a tx hash does not resend (it cannot
+tell whether the previous broadcast left the building): it waits while the intent is young and pushes it
+to `needs_review` after `StuckAfter`. There is no real chain sender yet; `Example_settleThroughQueue`
+(`internal/relayer/example_test.go`) walks a normal job, a lease takeover and a send failure through it.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
