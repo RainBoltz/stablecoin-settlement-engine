@@ -18,8 +18,8 @@
 // 代價是 RPC 抖一下、或 worker 慢一點，就會有 intent 送審。要讓 relayer 敢在 settling 重送，得先能證明上一次的交易到底
 // 有沒有出門，那需要 nonce 與每一次嘗試的紀錄，之後會討論。
 //
-// 今天沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 同時跑、nonce 怎麼排、送出失敗怎麼分類、
-// 放棄的 job 去哪，都之後會討論。
+// 沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 怎麼共用一條 queue、怎麼收工、怎麼不把 RPC 打爆，
+// 見 Pool 與 Throttle；nonce 怎麼排、送出失敗怎麼分類、放棄的 job 去哪，之後會討論。
 package relayer
 
 import (
@@ -102,12 +102,14 @@ func DefaultConfig() Config {
 	return Config{Lease: 30 * time.Second, RetryAfter: 5 * time.Second, StuckAfter: 5 * time.Minute}
 }
 
-// Worker 是一個單執行緒的處理迴圈：領一份、做一份。多個 Worker 共用同一條 queue 就是 worker pool，之後會討論。
+// Worker 是一個處理迴圈：領一份、做一份。它自己沒有狀態，所以多個 goroutine 可以共用同一個 Worker 對同一條 queue 領工作，
+// Pool 就是這樣做的。
 type Worker struct {
 	queue   queue.Queue
 	intents intent.Store
 	journal ledger.Journal
 	sender  Sender
+	limiter Limiter
 	cfg     Config
 	now     func() time.Time
 	observe func(Report)
@@ -125,9 +127,13 @@ func WithConfig(c Config) Option { return func(w *Worker) { w.cfg = c } }
 // WithObserver 讓 Run 每處理完一份 job 就回報一次（印 log、算指標都從這裡接）。
 func WithObserver(f func(Report)) Option { return func(w *Worker) { w.observe = f } }
 
+// WithLimiter 換掉限流器（預設 Unlimited）。多個 worker 共用同一個 Worker 時，它們也就共用同一個 Limiter，
+// 這正是要的：名額限的是整個 pool 對外的總量，不是每個 worker 各自的。
+func WithLimiter(l Limiter) Option { return func(w *Worker) { w.limiter = l } }
+
 // New 建立一個 Worker。四個依賴都是介面：queue、intent store、journal、sender，今天全是記憶體版或 fake。
 func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sender, opts ...Option) *Worker {
-	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, cfg: DefaultConfig(), now: time.Now}
+	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{}, cfg: DefaultConfig(), now: time.Now}
 	for _, o := range opts {
 		o(w)
 	}
@@ -208,6 +214,16 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 		return Report{Outcome: OutcomeRetry, Detail: "not authorized yet"}, nil
 
 	case intent.StateAuthorized:
+		// 先跟 limiter 要一個送出的名額，拿到之前一個 byte 都不寫：這時放手最便宜，intent 還在 authorized、帳上沒有 hold，
+		// job Nack 回 queue 就好（為什麼不把名額擋在 Send 裡面，見 Limiter）。等待的上限是這份 lease 剩下的時間：
+		// lease 過期後 job 會被別人領走，再等下去也輪不到我們做。
+		actx, cancel := context.WithTimeout(ctx, d.LeaseUntil.Sub(w.now()))
+		err := w.limiter.Acquire(actx)
+		cancel()
+		if err != nil {
+			return Report{Outcome: OutcomeRetry, Detail: "throttled: " + err.Error()}, nil
+		}
+		defer w.limiter.Release()
 		if err := w.advance(ctx, it, intent.Request{To: intent.StateSettling, By: intent.ActorRelayer, At: w.now()}); err != nil {
 			if errors.Is(err, intent.ErrVersionConflict) {
 				return Report{Outcome: OutcomeRetry, Detail: "lost the race to settling, will re-read"}, nil
