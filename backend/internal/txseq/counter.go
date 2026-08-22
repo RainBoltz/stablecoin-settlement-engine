@@ -62,7 +62,7 @@ func (c *Counter) Reserve(ctx context.Context, account string) (Reservation, err
 	return Reservation{Account: account, Value: v, Ordered: true}, nil
 }
 
-// Resolve 實作 Sequencer。三種收尾各自對計數器做一件事，見 Sent。
+// Resolve 實作 Sequencer。三種答案各自對計數器做一件事，見 Sent。
 //
 // 收尾之後帳戶就放開了，下一個等在 Reserve 的人可以進來；SentUnknown 的情況下它會拿到 ErrGap。
 func (c *Counter) Resolve(_ context.Context, r Reservation, s Sent) error {
