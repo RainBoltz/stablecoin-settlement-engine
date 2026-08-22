@@ -16,10 +16,11 @@
 // 它不知道上一次的交易送出去了沒（可能死在廣播前，也可能死在廣播後、寫回 confirming 前）。再送一次可能付兩次，
 // 所以它只做兩件事：還年輕就 Nack 等一等（上一個 worker 可能只是慢），超過 StuckAfter 就推到 needs_review 讓人看。
 // 代價是 RPC 抖一下、或 worker 慢一點，就會有 intent 送審。要讓 relayer 敢在 settling 重送，得先能證明上一次的交易到底
-// 有沒有出門，那需要 nonce 與每一次嘗試的紀錄，之後會討論。
+// 有沒有出門，那需要每一次嘗試的紀錄（送出去的是哪一個序號、哪一個 tx hash），之後會討論。
 //
 // 沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 怎麼共用一條 queue、怎麼收工、怎麼不把 RPC 打爆，
-// 見 Pool 與 Throttle；nonce 怎麼排、送出失敗怎麼分類、放棄的 job 去哪，之後會討論。
+// 見 Pool 與 Throttle；同一個帳戶送出的交易在鏈上怎麼排成一列，見 OrderedSender 與 internal/txseq；
+// 送出失敗怎麼分類、放棄的 job 去哪，之後會討論。
 package relayer
 
 import (
@@ -32,12 +33,13 @@ import (
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/ledger"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/queue"
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txseq"
 )
 
 // Sender 把一筆 intent 的付款送上鏈、回傳 tx hash。今天只有測試用的 fake；接真的鏈時，chain adapter 實作這個介面。
 //
 // 回傳 error 的意思是「這次沒送成」，但 relayer 不敢假設「沒送成等於沒送出去」：RPC 逾時的那筆可能已經被節點收下了。
-// 這就是為什麼 Send 失敗之後 relayer 只 Nack，不自己再送一次。
+// 這就是為什麼 Send 失敗之後 relayer 只 Nack，不自己再送一次。確定沒出門的那幾種錯誤要包 ErrNotSent，見下面。
 type Sender interface {
 	Send(ctx context.Context, it *intent.Intent) (txHash string, err error)
 }
@@ -47,6 +49,29 @@ type SenderFunc func(ctx context.Context, it *intent.Intent) (string, error)
 
 // Send 實作 Sender。
 func (f SenderFunc) Send(ctx context.Context, it *intent.Intent) (string, error) { return f(ctx, it) }
+
+// ErrNotSent 是 Sender 說「這筆確定沒出門」的方式：簽名失敗、參數組不出來、連線根本沒建立。包在錯誤裡
+// （fmt.Errorf("%w: ...", relayer.ErrNotSent)）relayer 才敢把序號收回來給下一筆用。沒包的錯誤一律當成「不知道」，
+// 序號就此留一個洞（見 txseq.Sent）。這個介面刻意做成「要主動宣告」而不是「預設沒送出去」：
+// 猜錯的代價不對稱，把出門了的當成沒出門會撞到自己那筆還躺在 mempool 的交易。
+var ErrNotSent = errors.New("relayer: transaction was not sent")
+
+// OrderedSender 是「序號要發送方自己算」的那類鏈的 Sender：EVM 的 nonce、TON 的 seqno 都要在簽名之前就決定
+// 這筆交易站哪一格。worker 看到 sender 實作了這個介面，就會先跟 Sequencer 取號再呼叫 SendAt。
+//
+// 沒實作的走原本的 Send，relayer 完全不介入：Solana 的 recent blockhash 與 SUI 的 object version 都是送出當下
+// 從鏈上讀的，同一個帳戶要同時送幾筆都行（見 txseq 的 package 註解）。
+//
+// 它包含 Sender，是為了讓一個 OrderedSender 可以直接塞進 New；實作者可以讓 Send 回一句「這條鏈的交易沒有序號組不出來」，
+// worker 不會呼叫它。
+type OrderedSender interface {
+	Sender
+	// Account 回報這筆 intent 會從哪個帳戶送出去。序號綁在帳戶上，不是綁在 intent 上：
+	// 兩筆付款只要從同一個錢包出去，就得排隊。
+	Account(it *intent.Intent) string
+	// SendAt 帶著序號送。res.Value 就是要填進交易的 nonce 或 seqno。
+	SendAt(ctx context.Context, it *intent.Intent, res txseq.Reservation) (txHash string, err error)
+}
 
 // Outcome 是 worker 處理一份 job 的四種結果。哪一種對應 Ack、哪一種對應 Nack，見 RunOnce。
 type Outcome string
@@ -110,6 +135,7 @@ type Worker struct {
 	journal ledger.Journal
 	sender  Sender
 	limiter Limiter
+	seq     txseq.Sequencer
 	cfg     Config
 	now     func() time.Time
 	observe func(Report)
@@ -127,13 +153,18 @@ func WithConfig(c Config) Option { return func(w *Worker) { w.cfg = c } }
 // WithObserver 讓 Run 每處理完一份 job 就回報一次（印 log、算指標都從這裡接）。
 func WithObserver(f func(Report)) Option { return func(w *Worker) { w.observe = f } }
 
+// WithSequencer 換掉發號器（預設一個空的 txseq.Counter）。只有 sender 是 OrderedSender 時才用得到；
+// 接真的鏈時要先對每個發送帳戶 Sync 一次，不然第一筆交易會拿到一個早就用過的號。
+func WithSequencer(s txseq.Sequencer) Option { return func(w *Worker) { w.seq = s } }
+
 // WithLimiter 換掉限流器（預設 Unlimited）。多個 worker 共用同一個 Worker 時，它們也就共用同一個 Limiter，
 // 這正是要的：名額限的是整個 pool 對外的總量，不是每個 worker 各自的。
 func WithLimiter(l Limiter) Option { return func(w *Worker) { w.limiter = l } }
 
 // New 建立一個 Worker。四個依賴都是介面：queue、intent store、journal、sender，今天全是記憶體版或 fake。
 func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sender, opts ...Option) *Worker {
-	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{}, cfg: DefaultConfig(), now: time.Now}
+	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{},
+		seq: txseq.NewCounter(), cfg: DefaultConfig(), now: time.Now}
 	for _, o := range opts {
 		o(w)
 	}
@@ -194,8 +225,9 @@ func (w *Worker) Run(ctx context.Context, idle time.Duration) error {
 // intent 在 authorized」；每一次都重讀 intent、照它現在的狀態走：
 //
 //   - created：還沒 authorized（簽名迴圈還沒走完，或 job 比 intent 早到）。retry。
-//   - authorized：正常路。CAS 推到 settling（輸了就是別人先動了它：另一個 worker、或 API 取消；retry，下次重讀再說）、
-//     記 hold、Send、推到 confirming。Send 失敗只 retry（見 Sender），下一次交付會落到 settling 那一格。
+//   - authorized：正常路。取號（見 OrderedSender）、CAS 推到 settling（輸了就是別人先動了它：另一個 worker、
+//     或 API 取消；retry，下次重讀再說）、記 hold、Send、推到 confirming。Send 失敗只 retry（見 Sender），
+//     下一次交付會落到 settling 那一格。
 //   - settling：上一次的 worker 死在半路，或還在送。沒有 tx hash 可看（進 confirming 才會有）。年輕就 retry，
 //     超過 StuckAfter 就 needs_review。
 //   - 其他（confirming、needs_review、settled、failed、canceled）：relayer 沒有事可做。no-op。
@@ -224,6 +256,24 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 			return Report{Outcome: OutcomeRetry, Detail: "throttled: " + err.Error()}, nil
 		}
 		defer w.limiter.Release()
+
+		// 取號跟拿名額一樣擋在副作用之前，理由也一樣：等待要在什麼都還沒寫的時候等，拿不到就原封不動回 queue
+		// （intent 還在 authorized、帳上沒有 hold）。但歸還的規則不一樣：名額 defer 就還，序號要看交易到底有沒有出門，
+		// 所以 sent 一路帶到函式結束才收尾。預設 SentNo：只要沒走到 Send，這個號就沒被用掉，退回去給下一筆用。
+		ordered, isOrdered := w.sender.(OrderedSender)
+		res, sent := txseq.Reservation{}, txseq.SentNo
+		if isOrdered {
+			rctx, cancel := context.WithTimeout(ctx, d.LeaseUntil.Sub(w.now()))
+			r, rerr := w.seq.Reserve(rctx, ordered.Account(it))
+			cancel()
+			if rerr != nil {
+				return Report{Outcome: OutcomeRetry, Detail: "no slot: " + rerr.Error()}, nil
+			}
+			res = r
+			// 收尾用 WithoutCancel：ctx 被取消的時候序號更需要交代，不交代就是留一個洞。
+			defer func() { _ = w.seq.Resolve(context.WithoutCancel(ctx), res, sent) }()
+		}
+
 		if err := w.advance(ctx, it, intent.Request{To: intent.StateSettling, By: intent.ActorRelayer, At: w.now()}); err != nil {
 			if errors.Is(err, intent.ErrVersionConflict) {
 				return Report{Outcome: OutcomeRetry, Detail: "lost the race to settling, will re-read"}, nil
@@ -234,10 +284,22 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 		if _, _, err := w.journal.Append(ctx, holdEntry(it)); err != nil {
 			return Report{}, err
 		}
-		txHash, err := w.sender.Send(ctx, it)
-		if err != nil {
-			return Report{Outcome: OutcomeRetry, Detail: "send: " + err.Error()}, nil
+		var txHash string
+		var serr error
+		if isOrdered {
+			txHash, serr = ordered.SendAt(ctx, it, res)
+		} else {
+			txHash, serr = w.sender.Send(ctx, it)
 		}
+		if serr != nil {
+			// 沒宣告 ErrNotSent 的失敗一律當成「不知道」：序號當成用掉了，這個帳戶到對帳為止不再發號。
+			// 退回去重用會撞到自己那筆可能還躺在 mempool 的交易，那比停下來貴得多。
+			if !errors.Is(serr, ErrNotSent) {
+				sent = txseq.SentUnknown
+			}
+			return Report{Outcome: OutcomeRetry, Detail: "send: " + serr.Error()}, nil
+		}
+		sent = txseq.SentYes
 		// 這裡若寫不回去（store 掛了），交易已經在路上、intent 卻停在 settling：下一次交付會走 settling 那一格，
 		// 最後由人（或之後的 listener）拿著鏈上的 ref 對回來。今天先接受這個洞。
 		if err := w.advance(ctx, it, intent.Request{To: intent.StateConfirming, By: intent.ActorRelayer, TxHash: txHash, At: w.now()}); err != nil {
