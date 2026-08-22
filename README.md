@@ -146,6 +146,19 @@ untouched (still `authorized`, no `hold`), because a job throttled after `settli
 It caps sends in flight (a semaphore) and sends per second (a token bucket), both stdlib-only.
 `Example_poolDrain` and `Example_throttle` (`internal/relayer/example_pool_test.go`) show both.
 
+Every transaction leaving the same wallet has to take a place in that wallet's line, and the four chains
+disagree on what the place is: an EVM `nonce` and a TON `seqno` are counters the sender computes itself,
+while a Solana recent blockhash and a SUI owned-object version are read from the chain at send time.
+`internal/txseq` handles the first kind. `Counter` hands out one number at a time per account, and each
+reservation is resolved exactly once: `SentYes` (used), `SentNo` (definitely never broadcast, so the number
+goes back) or `SentUnknown` (no idea, so the number is burned and the account stops issuing until `Sync`
+shows the chain walked past the gap). Only errors wrapping `relayer.ErrNotSent` count as "not broadcast";
+anything else is unknown, because reusing a nonce that may already sit in the mempool is the expensive
+mistake. A `Sender` that also implements `OrderedSender` gets a reservation before the worker writes
+anything, so a job that cannot get one leaves the intent `authorized` with no `hold`; a plain `Sender`
+never touches the sequencer. `Example_counter` (`internal/txseq/example_test.go`) and `Example_nonceGap`
+(`internal/relayer/example_nonce_test.go`) walk through both.
+
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
 so the diff shows up in review. `go test ./internal/intent -run Example -v` walks one intent through its lifecycle.
