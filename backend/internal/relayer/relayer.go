@@ -21,7 +21,8 @@
 //
 // 沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 怎麼共用一條 queue、怎麼收工、怎麼不把 RPC 打爆，
 // 見 Pool 與 Throttle；同一個帳戶送出的交易在鏈上怎麼排成一列，見 OrderedSender 與 internal/txseq；
-// 一次失敗值不值得再交付一次，見 internal/txfail 與 Worker.poison。
+// 一次失敗值不值得再交付一次，見 internal/txfail 與 Worker.poison；停止重試的那份 job 停到哪裡去、
+// 誰有資格把它放回來，見 internal/dlq。
 package relayer
 
 import (
@@ -31,6 +32,7 @@ import (
 	"math/big"
 	"time"
 
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/dlq"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/ledger"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/queue"
@@ -92,8 +94,8 @@ const (
 	OutcomeReplaced Outcome = "replaced"
 	// OutcomeCleared：放棄這筆付款，在原本那個號上送了一筆不動錢的交易把那一格清出來，intent 推到 needs_review。Ack。
 	OutcomeCleared Outcome = "cleared"
-	// OutcomePoison：這份 job 再交付幾次結果都一樣（錯誤宣告了，或重試預算用完），停止重試。Ack。
-	// 那筆 intent 要不要跟著收尾、怎麼收尾，看它停在哪一格，見 Worker.poison。
+	// OutcomePoison：這份 job 再交付幾次結果都一樣（錯誤宣告了，或 max attempts 用完），停止重試。Ack。
+	// 那筆 intent 要不要跟著收尾、怎麼收尾，看它停在哪一格；那份 job 本身停進 dlq 等人，都見 Worker.poison。
 	OutcomePoison Outcome = "poison"
 )
 
@@ -128,7 +130,7 @@ type Config struct {
 	// Lease 是一份 job 被領走後最多可以隱形多久。要比「讀 intent、寫兩次、送一次交易」的正常耗時長很多，
 	// 不然慢一點的 worker 會被當成死了。這裡設 30 秒。
 	Lease time.Duration
-	// RetryAfter 是退避階梯的第一階：第一次 Nack 之後多久再交付，之後每一次加倍（見 internal/txfail）。
+	// RetryAfter 是 backoff 階梯的第一階：第一次 Nack 之後多久再交付，之後每一次加倍（見 internal/txfail）。
 	// 所以它只決定起點，不決定一份 job 最久隔多久回來。這裡設 5 秒。
 	RetryAfter time.Duration
 	// StuckAfter 是 intent 在 settling 沒有 tx hash 多久之後算「下落不明」、送去 needs_review。
@@ -154,6 +156,7 @@ type Worker struct {
 	fee        txfee.Policy
 	faults     txfail.Policy
 	broadcasts Broadcasts
+	dead       dlq.Store
 	now        func() time.Time
 	observe    func(Report)
 }
@@ -181,18 +184,22 @@ func WithLimiter(l Limiter) Option { return func(w *Worker) { w.limiter = l } }
 // WithFeePolicy 換掉替換規則（預設 txfee.DefaultPolicy）。起價、加價幅度、天花板、最多廣播幾次都在裡面。
 func WithFeePolicy(p txfee.Policy) Option { return func(w *Worker) { w.fee = p } }
 
-// WithFaultPolicy 換掉重試規則（預設 txfail.DefaultPolicy）。一份 job 最多交付幾次、退避的上限、抖不抖都在裡面。
+// WithFaultPolicy 換掉重試規則（預設 txfail.DefaultPolicy）。一份 job 最多交付幾次、backoff 的上限、加不加 jitter 都在裡面。
 func WithFaultPolicy(p txfail.Policy) Option { return func(w *Worker) { w.faults = p } }
 
 // WithBroadcasts 換掉廣播紀錄本（預設一本空的 MemoryBroadcasts）。多個 worker 要共用同一本，
 // 不然重來的那個 worker 讀不到前一個 worker 送出去的東西，救援就退回成送審。
 func WithBroadcasts(b Broadcasts) Option { return func(w *Worker) { w.broadcasts = b } }
 
+// WithDeadLetters 換掉停放被放棄的 job 的地方（預設一個空的 dlq.MemoryStore）。人要看得到那些 job，
+// 所以整個 pool 與那支給人用的介面要共用同一個。
+func WithDeadLetters(s dlq.Store) Option { return func(w *Worker) { w.dead = s } }
+
 // New 建立一個 Worker。四個依賴都是介面：queue、intent store、journal、sender，今天全是記憶體版或 fake。
 func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sender, opts ...Option) *Worker {
 	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{},
 		seq: txseq.NewCounter(), cfg: DefaultConfig(), fee: txfee.DefaultPolicy(), faults: txfail.DefaultPolicy(),
-		broadcasts: NewMemoryBroadcasts(), now: time.Now}
+		broadcasts: NewMemoryBroadcasts(), dead: dlq.NewMemoryStore(), now: time.Now}
 	for _, o := range opts {
 		o(w)
 	}
