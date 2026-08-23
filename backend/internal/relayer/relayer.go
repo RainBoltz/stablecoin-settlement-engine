@@ -12,11 +12,12 @@
 // Ack 永遠是最後一步：中間任何一步死掉，lease 過期後 job 會再回來，重來的那個 worker 照 intent 現在的狀態決定要做什麼
 // （見 Worker.process）。
 //
-// 今天最保守的一條規則在 settling 那一格：重來的 worker 看到 intent 已經在 settling、卻沒有 tx hash，
-// 它不知道上一次的交易送出去了沒（可能死在廣播前，也可能死在廣播後、寫回 confirming 前）。再送一次可能付兩次，
-// 所以它只做兩件事：還年輕就 Nack 等一等（上一個 worker 可能只是慢），超過 StuckAfter 就推到 needs_review 讓人看。
-// 代價是 RPC 抖一下、或 worker 慢一點，就會有 intent 送審。要讓 relayer 敢在 settling 重送，得先能證明上一次的交易到底
-// 有沒有出門，那需要每一次嘗試的紀錄（送出去的是哪一個序號、哪一個 tx hash），之後會討論。
+// settling 那一格的規則本來很保守：重來的 worker 看到 intent 已經在 settling、卻沒有 tx hash，它不知道上一次的交易
+// 送出去了沒（可能死在廣播前，也可能死在廣播後、寫回 confirming 前），再送一次可能付兩次，所以它只能等，
+// 超過 StuckAfter 就推到 needs_review。代價是 RPC 抖一下、或 worker 慢一點，就會有 intent 送審。
+// 現在它多了一招：Broadcasts 記著每一次嘗試站的是哪一個號、出了多少價，所以重來的 worker 有辦法在同一個號上
+// 送一筆更貴的交易，把可能還在 mempool 裡的那筆換掉（見 Worker.rescue 與 internal/txfee）。同號最多一筆會進區塊，
+// 所以再送一次不會讓錢多動一次。
 //
 // 沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 怎麼共用一條 queue、怎麼收工、怎麼不把 RPC 打爆，
 // 見 Pool 與 Throttle；同一個帳戶送出的交易在鏈上怎麼排成一列，見 OrderedSender 與 internal/txseq；
@@ -33,6 +34,7 @@ import (
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/ledger"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/queue"
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txfee"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txseq"
 )
 
@@ -85,6 +87,10 @@ const (
 	OutcomeRetry Outcome = "retry"
 	// OutcomeReview：intent 卡在 settling 太久又沒有 tx hash，交易下落不明，推到 needs_review 讓人看。Ack。
 	OutcomeReview Outcome = "needs_review"
+	// OutcomeReplaced：在原本那個號上用更高的出價再送了一次同一筆付款，intent 走到 confirming。Ack。
+	OutcomeReplaced Outcome = "replaced"
+	// OutcomeCleared：放棄這筆付款，在原本那個號上送了一筆不動錢的交易把那一格清出來，intent 推到 needs_review。Ack。
+	OutcomeCleared Outcome = "cleared"
 )
 
 // Report 是處理一份 job 的結果，Run 會交給 observer、Example 會印出來。
@@ -130,15 +136,17 @@ func DefaultConfig() Config {
 // Worker 是一個處理迴圈：領一份、做一份。它自己沒有狀態，所以多個 goroutine 可以共用同一個 Worker 對同一條 queue 領工作，
 // Pool 就是這樣做的。
 type Worker struct {
-	queue   queue.Queue
-	intents intent.Store
-	journal ledger.Journal
-	sender  Sender
-	limiter Limiter
-	seq     txseq.Sequencer
-	cfg     Config
-	now     func() time.Time
-	observe func(Report)
+	queue      queue.Queue
+	intents    intent.Store
+	journal    ledger.Journal
+	sender     Sender
+	limiter    Limiter
+	seq        txseq.Sequencer
+	cfg        Config
+	fee        txfee.Policy
+	broadcasts Broadcasts
+	now        func() time.Time
+	observe    func(Report)
 }
 
 // Option 調整 Worker 的預設值。
@@ -161,10 +169,18 @@ func WithSequencer(s txseq.Sequencer) Option { return func(w *Worker) { w.seq = 
 // 這正是要的：名額限的是整個 pool 對外的總量，不是每個 worker 各自的。
 func WithLimiter(l Limiter) Option { return func(w *Worker) { w.limiter = l } }
 
+// WithFeePolicy 換掉替換規則（預設 txfee.DefaultPolicy）。起價、加價幅度、天花板、最多廣播幾次都在裡面。
+func WithFeePolicy(p txfee.Policy) Option { return func(w *Worker) { w.fee = p } }
+
+// WithBroadcasts 換掉廣播紀錄本（預設一本空的 MemoryBroadcasts）。多個 worker 要共用同一本，
+// 不然重來的那個 worker 讀不到前一個 worker 送出去的東西，救援就退回成送審。
+func WithBroadcasts(b Broadcasts) Option { return func(w *Worker) { w.broadcasts = b } }
+
 // New 建立一個 Worker。四個依賴都是介面：queue、intent store、journal、sender，今天全是記憶體版或 fake。
 func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sender, opts ...Option) *Worker {
 	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{},
-		seq: txseq.NewCounter(), cfg: DefaultConfig(), now: time.Now}
+		seq: txseq.NewCounter(), cfg: DefaultConfig(), fee: txfee.DefaultPolicy(),
+		broadcasts: NewMemoryBroadcasts(), now: time.Now}
 	for _, o := range opts {
 		o(w)
 	}
@@ -229,7 +245,7 @@ func (w *Worker) Run(ctx context.Context, idle time.Duration) error {
 //     或 API 取消；retry，下次重讀再說）、記 hold、Send、推到 confirming。Send 失敗只 retry（見 Sender），
 //     下一次交付會落到 settling 那一格。
 //   - settling：上一次的 worker 死在半路，或還在送。沒有 tx hash 可看（進 confirming 才會有）。年輕就 retry，
-//     超過 StuckAfter 就 needs_review。
+//     久了就照 Broadcasts 的紀錄決定要不要在同一個號上替換掉它（見 Worker.rescue）。
 //   - 其他（confirming、needs_review、settled、failed、canceled）：relayer 沒有事可做。no-op。
 func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) {
 	it, err := w.intents.Get(ctx, d.Job.IntentID)
@@ -297,9 +313,11 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 			if !errors.Is(serr, ErrNotSent) {
 				sent = txseq.SentUnknown
 			}
+			w.record(ctx, it, res, w.fee.Base, "", sent)
 			return Report{Outcome: OutcomeRetry, Detail: "send: " + serr.Error()}, nil
 		}
 		sent = txseq.SentYes
+		w.record(ctx, it, res, w.fee.Base, txHash, sent)
 		// 這裡若寫不回去（store 掛了），交易已經在路上、intent 卻停在 settling：下一次交付會走 settling 那一格，
 		// 最後由人（或之後的 listener）拿著鏈上的 ref 對回來。今天先接受這個洞。
 		if err := w.advance(ctx, it, intent.Request{To: intent.StateConfirming, By: intent.ActorRelayer, TxHash: txHash, At: w.now()}); err != nil {
@@ -308,18 +326,7 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 		return Report{Outcome: OutcomeSent, TxHash: txHash}, nil
 
 	case intent.StateSettling:
-		age := w.now().Sub(it.UpdatedAt)
-		if age < w.cfg.StuckAfter {
-			return Report{Outcome: OutcomeRetry, Detail: fmt.Sprintf("settling for %s without tx hash, waiting", age)}, nil
-		}
-		reason := fmt.Sprintf("settling for %s without tx hash; broadcast outcome unknown", age)
-		if err := w.advance(ctx, it, intent.Request{To: intent.StateNeedsReview, By: intent.ActorRelayer, Reason: reason, At: w.now()}); err != nil {
-			if errors.Is(err, intent.ErrVersionConflict) {
-				return Report{Outcome: OutcomeRetry, Detail: "lost the race to needs_review, will re-read"}, nil
-			}
-			return Report{}, err
-		}
-		return Report{Outcome: OutcomeReview, Detail: reason}, nil
+		return w.rescue(ctx, d, it)
 
 	default:
 		return Report{Outcome: OutcomeNoop, Detail: "already " + string(it.State)}, nil
