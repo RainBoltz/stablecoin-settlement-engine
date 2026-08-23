@@ -6,10 +6,11 @@ Move money exactly once. A multichain stablecoin settlement engine.
 The repository is a monorepo: Solidity under `contracts/`, the Go off-chain side under `backend/`.
 Only the EVM contracts, the local devnet tooling, the Payment Intent state machine, the PaymentRef
 derivation, the first slice of the Payment API (create / get / trace an intent, behind an
-idempotency layer), the double-entry ledger, the job queue and the relayer worker pool (N workers
-over one queue, graceful drain, a throttle in front of the sender; the sender itself is still a fake)
-exist so far; the real chain senders and the non-EVM chains land in their own directories as the
-series progresses.
+idempotency layer), the double-entry ledger, the job queue and the relayer (N workers over one queue,
+graceful drain, a throttle in front of the sender, one nonce line per sending account, fee-bumped
+replacement for stuck transactions, and a retry policy that ends in a dead-letter store an operator
+can redrive from; the sender itself is still a fake) exist so far; the real chain senders and the
+non-EVM chains land in their own directories as the series progresses.
 
 ```
 Makefile                          # Entry points: make test, make devnet, make evm-test, make go-test, ...
@@ -40,12 +41,33 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── memory.go             # MemoryQueue: FIFO among visible jobs, idempotent enqueue while pending, attempt counter
     │   └── *_test.go             # Job_Validate, MemoryQueue_* (idempotent enqueue, lease hides, stale receipt, nack delay, concurrency), Example_leaseAckNack
     ├── relayer/                  # Relayer worker: lease a job, read the intent, settling -> hold -> send -> confirming, ack last
-    │   ├── relayer.go            # Sender interface, Worker (RunOnce / Run), Outcome (sent / no-op / retry / needs_review), Config, process()
+    │   ├── relayer.go            # Sender / OrderedSender, Worker (RunOnce / Run), Outcome (sent / no-op / retry / needs_review / replaced / cleared / poison), Config, process()
     │   ├── throttle.go           # Limiter interface (acquired before any side effect), Throttle: max in-flight semaphore + per-second token bucket
     │   ├── pool.go               # Pool: N goroutines over one Worker, pull not push, two-phase drain (stop leasing, wait, then abandon), panic containment, Stats
+    │   ├── broadcast.go          # Broadcast (which nonce, which fee, which hash, which send outcome), append-only Broadcasts, MemoryBroadcasts
+    │   ├── replace.go            # ReplacingSender (Replace / Cancel), rescue(): what to do about an intent stuck in settling
+    │   ├── poison.go             # poison(): give the payment an ending (void + failed, or needs_review), then park the job in the dlq
     │   └── *_test.go             # Worker_* (order pinned, redelivery no-op, lease takeover, send failure -> retry -> review, lost CAS, many workers, throttled job untouched),
-    │                             # Throttle_* (in-flight cap, per-second spacing, burst, refund on cancel), Pool_* (drain, drain timeout, panic, many workers throttled),
-    │                             # Example_settleThroughQueue, Example_poolDrain, Example_throttle
+    │                             # Throttle_* / Pool_* (drain, drain timeout, panic), Sequence_* / Replace_* / Poison_* / Redrive_*,
+    │                             # Example_settleThroughQueue, Example_poolDrain, Example_throttle, Example_nonceGap, Example_replaceStuck,
+    │                             # Example_poisonJob, Example_redriveJob
+    ├── txseq/                    # One line per sending account: hand out a nonce, resolve it exactly once, stop issuing when one goes missing
+    │   ├── txseq.go              # Reservation, Sent (yes / no / unknown), Sequencer interface, ErrNotSent / ErrNoGap, Unordered
+    │   ├── counter.go            # Counter: next number per account, Sync from the chain, gap bookkeeping, ReserveGap
+    │   └── *_test.go             # Counter_* (one at a time, refund, burned number, gap blocks, sync), Example_counter
+    ├── txfee/                    # What to do about a stuck transaction, and how much more to bid for it
+    │   ├── txfee.go              # Fee (both EIP-1559 fields), Policy (base, bump percent, ceiling, max broadcasts), Stuck
+    │   ├── plan.go               # Bump (rounds up, the node compares integers), Decide -> wait / speed up / cancel / review
+    │   └── *_test.go             # Bump_* (raises both fields, rounds up, stops at the ceiling), Decide_* (table), Example_ladder
+    ├── txfail/                   # Is this failed delivery worth another one? Pure function: no chain, no storage, no clock
+    │   ├── txfail.go             # Class (retryable / poison), ErrPoison, Policy (max attempts, max backoff, jitter), Backoff, EqualJitter
+    │   ├── verdict.go            # Fault (err + attempt + base), Verdict, Judge: the three-branch decision tree
+    │   └── *_test.go             # Policy_Backoff* (doubling, cap, no shift overflow), Judge_* (declared, budget, transient), Example_budget
+    ├── dlq/                      # Where a job goes when the retries stop: parked until a person redrives or drops it
+    │   ├── dlq.go                # Status (parked / redriven / dropped), Record (job + attempts + reason + intent state + cycles), Store interface, errors
+    │   ├── memory.go             # MemoryStore: park is idempotent while parked, resolve is the single atomic point
+    │   ├── redrive.go            # Redrive (enqueue first, sign the record second) and Drop
+    │   └── *_test.go             # Record_*, MemoryStore_* (idempotent park, new cycle, resolve once, concurrent winners), Redrive_* / Drop_*
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -189,6 +211,20 @@ intent in `settling` whose last broadcast is known not to have been sent has its
 `failed`, and anything else goes to `needs_review` because the money may already have moved.
 `Example_budget` (`internal/txfail/example_test.go`) walks the ladder and `Example_poisonJob`
 (`internal/relayer/example_poison_test.go`) walks the three endings.
+
+A job that stops being redelivered should not also stop existing. `internal/dlq` is where it waits:
+`Worker.poison` parks a `Record` - the job untouched, how many deliveries this trip took, the verdict,
+and which state the intent was left in - and nothing takes it out again on its own, because "another
+delivery will not help" is exactly what got it there. The only two verbs are a person's: `Redrive` puts
+the job back on the source queue as-is, `Drop` admits it is of no further use, and both are signed and
+timestamped on the record. `Redrive` enqueues before it signs, the opposite order to the rest of the
+system, because here it is the enqueue that replays as a no-op while the sign is the compare-and-swap;
+losing a note is cheaper than losing a job. Nothing about that ordering is what keeps money from moving
+twice - the worker re-reads the intent on every delivery, so redriving a finished payment costs one
+`no-op` and no ledger entries, and the only case a redrive actually rescues is an intent still waiting
+for the relayer. `Cycles` counts the round trips, since a note that comes straight back is not usually
+one more redrive away from working. `Example_redriveJob` (`internal/relayer/example_redrive_test.go`)
+sends the same three notes back and gets three different answers.
 
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
