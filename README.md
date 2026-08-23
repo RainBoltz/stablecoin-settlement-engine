@@ -159,6 +159,23 @@ anything, so a job that cannot get one leaves the intent `authorized` with no `h
 never touches the sequencer. `Example_counter` (`internal/txseq/example_test.go`) and `Example_nonceGap`
 (`internal/relayer/example_nonce_test.go`) walk through both.
 
+A number that was handed out but never accounted for leaves a gap, and on EVM a gap parks every later
+transaction from that wallet in the node's queued area. The way out is replacement: send another
+transaction at the same number with a higher fee. At most one transaction per number ever makes it into
+a block, so replacing cannot move the money twice. `internal/txfee` owns that decision and nothing else
+(no chain, no storage, no clock): `Bump` raises both EIP-1559 fields by `BumpPercent` and rounds up, since
+the node compares against an integer threshold, and `Decide` turns "how long has it been stuck, what did
+the last broadcast return, how many times have we tried" into one of four plans - wait, speed up (send the
+same payment again, dearer), cancel (send a no-op transaction to clear the number and let the queue behind
+it move) or review (the bumped fee is over the ceiling, so nothing can outbid the old transaction).
+`internal/relayer` keeps every attempt in `Broadcasts` - which number, which fee, which tx hash, which of
+the three send outcomes - because a worker that cannot say what the previous attempt did can only wait and
+escalate. A `Sender` that also implements `ReplacingSender` (EVM and TON, the chains whose number the
+sender computes) gets rescued; the rest still go to `needs_review`, because a Solana or SUI transaction is
+re-sent as-is, never replaced. After a replacement the intent carries the hash of the last attempt, not
+necessarily of the transaction that wins the slot. `Example_ladder` (`internal/txfee/example_test.go`) and
+`Example_replaceStuck` (`internal/relayer/example_replace_test.go`) walk through both halves.
+
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
 so the diff shows up in review. `go test ./internal/intent -run Example -v` walks one intent through its lifecycle.
