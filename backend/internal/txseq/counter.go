@@ -17,6 +17,9 @@ import (
 //
 // 計數器的真相在鏈上，不在這裡：程序重啟、或有人用同一個錢包在外面送了交易，都要靠 Sync 對回來
 // （EVM 上就是 eth_getTransactionCount）。這裡記的只是「我發到哪了」。
+//
+// 洞有兩種消失的方式：Sync 看到鏈上已經走過那一格（那筆下落不明的交易其實上鏈了），
+// 或是有人用 ReserveGap 把那個號拿回去、送出一筆替換交易把它填掉。
 type Counter struct {
 	mu       sync.Mutex
 	accounts map[string]*account
@@ -62,7 +65,29 @@ func (c *Counter) Reserve(ctx context.Context, account string) (Reservation, err
 	return Reservation{Account: account, Value: v, Ordered: true}, nil
 }
 
-// Resolve 實作 Sequencer。三種答案各自對計數器做一件事，見 Sent。
+// ReserveGap 實作 Sequencer。把洞那一格的號再發一次，給替換交易用；沒有洞回 ErrNoGap。
+//
+// 它跟 Reserve 走同一個 semaphore：同一個帳戶一次只有一個號在飛，補洞的那一筆也不例外。
+// 發出去的 Reservation 帶著 Fill，Resolve 才知道這一次不能撥計數器。
+func (c *Counter) ReserveGap(ctx context.Context, account string) (Reservation, error) {
+	a := c.account(account)
+	select {
+	case <-a.sem:
+	case <-ctx.Done():
+		return Reservation{}, ctx.Err()
+	}
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if a.gap == nil {
+		a.sem <- struct{}{}
+		return Reservation{}, ErrNoGap
+	}
+	v := *a.gap
+	a.out = &v
+	return Reservation{Account: account, Value: v, Ordered: true, Fill: true}, nil
+}
+
+// Resolve 實作 Sequencer。三種答案各自對計數器做一件事，見 Sent；補洞的那一次（Fill）另外一套規則。
 //
 // 收尾之後帳戶就放開了，下一個等在 Reserve 的人可以進來；SentUnknown 的情況下它會拿到 ErrGap。
 func (c *Counter) Resolve(_ context.Context, r Reservation, s Sent) error {
@@ -75,11 +100,21 @@ func (c *Counter) Resolve(_ context.Context, r Reservation, s Sent) error {
 	if !ok || a.out == nil || *a.out != r.Value {
 		return fmt.Errorf("%w: %s", ErrStale, r)
 	}
-	switch s {
-	case SentNo:
+	switch {
+	case r.Fill:
+		// 補洞的那一次：計數器早就走過這一格了，怎麼樣都不撥。送出去了（不管最後上鏈的是新的還是舊的那一筆）
+		// 就當這一格有人認領，洞消失、帳戶恢復發號；沒送出去或不知道，洞就留著等下一次。
+		//
+		// 「送出去就恢復發號」是刻意的取捨：後面那些號在 EVM 上會排進節點的 queued 區等這一格進區塊，
+		// 而我們剛送出去的是一筆出價更高的交易，等它不會太久。若堅持等鏈上確認才恢復，
+		// 整個錢包會停到有人來對帳，救援等於沒救。
+		if s == SentYes {
+			a.gap = nil
+		}
+	case s == SentNo:
 		// 確定沒出門，把計數器撥回去。窗口是 1，所以這個號一定是最大的那個，撥回去不會蓋到別人。
 		a.next = r.Value
-	case SentUnknown:
+	case s == SentUnknown:
 		// 不知道，所以計數器不撥回去（那筆交易可能真的在鏈上），但這一格從此是個洞。
 		v := r.Value
 		a.gap = &v

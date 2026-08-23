@@ -206,3 +206,99 @@ func TestCounter_ConcurrentReservesHandOutEachValueOnce(t *testing.T) {
 		}
 	}
 }
+
+// TestCounter_ReserveGapHandsTheSameNumberBack：洞那一格的號可以再發一次，而且發出去的 Reservation
+// 帶著 Fill，Resolve 才知道這一次不能撥計數器。
+func TestCounter_ReserveGapHandsTheSameNumberBack(t *testing.T) {
+	ctx := context.Background()
+	c := NewCounter()
+	gapAcct := "0xabc"
+	r, err := c.Reserve(ctx, gapAcct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Resolve(ctx, r, SentUnknown); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.Status(gapAcct); !st.HasGap || st.Gap != 0 || st.Next != 1 {
+		t.Fatalf("after unknown: %s", st)
+	}
+	g, err := c.ReserveGap(ctx, gapAcct)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if g.Value != 0 || !g.Fill || !g.Ordered {
+		t.Fatalf("gap reservation: %+v", g)
+	}
+	if got := g.String(); got != "0xabc #0 fill" {
+		t.Fatalf("String() = %q", got)
+	}
+}
+
+// TestCounter_FilledGapReopensTheAccount：補洞的交易送出去了就當這一格有人認領，洞消失、帳戶恢復發號。
+// 計數器不會因此往前，那一格早就算用掉了。
+func TestCounter_FilledGapReopensTheAccount(t *testing.T) {
+	ctx := context.Background()
+	c := NewCounter()
+	gapAcct := "0xabc"
+	r, _ := c.Reserve(ctx, gapAcct)
+	_ = c.Resolve(ctx, r, SentUnknown)
+	g, _ := c.ReserveGap(ctx, gapAcct)
+	if err := c.Resolve(ctx, g, SentYes); err != nil {
+		t.Fatal(err)
+	}
+	if st := c.Status(gapAcct); st.HasGap || st.Next != 1 || st.InFlight {
+		t.Fatalf("after fill: %s", st)
+	}
+	next, err := c.Reserve(ctx, gapAcct)
+	if err != nil {
+		t.Fatalf("account should be issuing again: %v", err)
+	}
+	if next.Value != 1 || next.Fill {
+		t.Fatalf("next reservation: %+v", next)
+	}
+}
+
+// TestCounter_FailedFillKeepsTheGap：補洞的交易沒送出去（或不知道），洞就留著等下一次；
+// 計數器也不會被撥回去，因為那一格可能真的有一筆交易在鏈上。
+func TestCounter_FailedFillKeepsTheGap(t *testing.T) {
+	ctx := context.Background()
+	for _, s := range []Sent{SentNo, SentUnknown} {
+		c := NewCounter()
+		gapAcct := "0xabc"
+		r, _ := c.Reserve(ctx, gapAcct)
+		_ = c.Resolve(ctx, r, SentUnknown)
+		g, _ := c.ReserveGap(ctx, gapAcct)
+		if err := c.Resolve(ctx, g, s); err != nil {
+			t.Fatal(err)
+		}
+		st := c.Status(gapAcct)
+		if !st.HasGap || st.Gap != 0 || st.Next != 1 {
+			t.Fatalf("%s: %s", s, st)
+		}
+		if _, err := c.Reserve(ctx, gapAcct); !errors.Is(err, ErrGap) {
+			t.Fatalf("%s: account should still be stopped, got %v", s, err)
+		}
+	}
+}
+
+// TestCounter_ReserveGapWithoutGap：沒有洞就沒有東西可以替換。呼叫端拿到 ErrNoGap 要去走一般的 Reserve，
+// 不是把它當錯誤往上丟。
+func TestCounter_ReserveGapWithoutGap(t *testing.T) {
+	ctx := context.Background()
+	c := NewCounter()
+	if _, err := c.ReserveGap(ctx, "0xabc"); !errors.Is(err, ErrNoGap) {
+		t.Fatalf("got %v", err)
+	}
+	// semaphore 要還回去，不然這個帳戶會從此發不出號。
+	if _, err := c.Reserve(ctx, "0xabc"); err != nil {
+		t.Fatalf("account should still be usable: %v", err)
+	}
+}
+
+// TestUnordered_ReserveGap：不發號的鏈沒有序列，也就沒有洞。
+func TestUnordered_ReserveGap(t *testing.T) {
+	if _, err := (Unordered{}).ReserveGap(context.Background(), "sol"); !errors.Is(err, ErrNoGap) {
+		t.Fatalf("got %v", err)
+	}
+}

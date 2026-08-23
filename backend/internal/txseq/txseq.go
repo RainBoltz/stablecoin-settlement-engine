@@ -43,12 +43,18 @@ type Reservation struct {
 	Account string
 	Value   uint64
 	Ordered bool
+	// Fill 代表這一次取的是序列上那個洞的號（見 ErrGap），拿去送的是一筆替換交易。
+	// 收尾規則跟一般取號不同：這個號本來就已經算用掉了，所以送成功只是把洞補起來，送失敗也不會把計數器往回撥。
+	Fill bool
 }
 
 // String 印一個取號結果，Example 會直接貼這個格式。地址縮寫成 0x1234…abcd，跟 ledger 印帳的科目同一種縮法。
 func (r Reservation) String() string {
 	if !r.Ordered {
 		return "no slot needed"
+	}
+	if r.Fill {
+		return fmt.Sprintf("%s #%d fill", shortAccount(r.Account), r.Value)
 	}
 	return fmt.Sprintf("%s #%d", shortAccount(r.Account), r.Value)
 }
@@ -83,12 +89,20 @@ var (
 	ErrStale = errors.New("txseq: reservation is stale")
 	// ErrBusy：這個帳戶還有一個序號沒收尾，現在不能跟鏈上對齊。
 	ErrBusy = errors.New("txseq: account has an outstanding reservation")
+	// ErrNoGap：這個帳戶的序列上沒有洞，沒有東西可以替換。
+	// 呼叫端拿到它應該去走一般的 Reserve，而不是把它當錯誤往上丟。
+	ErrNoGap = errors.New("txseq: account has no gap to fill")
 )
 
 // Sequencer 是發號的介面。只有兩個動作：取號、收尾。誰去問鏈、序號長什麼樣、拿不到號要不要等，都是實作的事。
 type Sequencer interface {
 	// Reserve 幫 account 取一個號。取不到就等，等到 ctx 結束為止；帳戶上有洞時直接回 ErrGap，不等。
 	Reserve(ctx context.Context, account string) (Reservation, error)
+	// ReserveGap 把序列上那個洞的號再發一次，給替換交易用。沒有洞就回 ErrNoGap，不等。
+	//
+	// 它跟 Reserve 分成兩個方法，是因為呼叫端的意圖不一樣：Reserve 是「我要送一筆新的」，
+	// ReserveGap 是「我要去把那一格搶回來」。同一個號發第二次是危險動作，得寫出來才做得到。
+	ReserveGap(ctx context.Context, account string) (Reservation, error)
 	// Resolve 收尾。一個 Reservation 只能收尾一次，第二次是 ErrStale。
 	Resolve(ctx context.Context, r Reservation, s Sent) error
 }
@@ -100,6 +114,12 @@ type Unordered struct{}
 // Reserve 實作 Sequencer：回一個 Ordered=false 的空位置。
 func (Unordered) Reserve(_ context.Context, account string) (Reservation, error) {
 	return Reservation{Account: account}, nil
+}
+
+// ReserveGap 實作 Sequencer：不發號的鏈沒有序列，也就沒有洞。Solana 與 SUI 卡住的時候不是替換，
+// 是原封不動重送同一筆交易（見 txfee 的 package 註解）。
+func (Unordered) ReserveGap(context.Context, string) (Reservation, error) {
+	return Reservation{}, ErrNoGap
 }
 
 // Resolve 實作 Sequencer：沒有序號可以收尾。
