@@ -48,10 +48,14 @@ func DefaultPoolConfig() PoolConfig {
 	return PoolConfig{Size: 4, Idle: time.Second, DrainTimeout: 20 * time.Second}
 }
 
-// Stats 是一次 Run 的統計。前四個照 Outcome 分；Errors 是 process 回錯的次數（job 已 Nack）；
+// Stats 是一次 Run 的統計。前五個照 Outcome 分；Errors 是 process 回錯的次數（job 已 Nack）；
 // Panics 是 worker goroutine 從 panic 裡爬起來的次數；Abandoned 是收工逾時時還在手上、被放棄的 job 數。
+//
+// Poison 是這一輪停止重試的 job 數。它跟 Retry 要分開看：Retry 高只是這批工作暫時做不動，
+// Poison 只要不是零就代表有東西被放棄了，該有人去看。
 type Stats struct {
 	Sent, Noop, Retry, Review uint64
+	Poison                    uint64
 	Errors, Panics            uint64
 	Abandoned                 int64
 }
@@ -130,6 +134,8 @@ func (p *Pool) runOne(ctx context.Context, st *stats, busy *atomic.Int64) (ok bo
 		st.retry.Add(1)
 	case OutcomeReview:
 		st.review.Add(1)
+	case OutcomePoison:
+		st.poison.Add(1)
 	}
 	return true
 }
@@ -137,6 +143,7 @@ func (p *Pool) runOne(ctx context.Context, st *stats, busy *atomic.Int64) (ok bo
 // stats 是 Stats 的可併發版本，Run 結束時 snapshot 成 Stats。
 type stats struct {
 	sent, noop, retry, review atomic.Uint64
+	poison                    atomic.Uint64
 	errors, panics            atomic.Uint64
 	abandoned                 atomic.Int64
 }
@@ -144,6 +151,7 @@ type stats struct {
 func (s *stats) snapshot() Stats {
 	return Stats{
 		Sent: s.sent.Load(), Noop: s.noop.Load(), Retry: s.retry.Load(), Review: s.review.Load(),
+		Poison: s.poison.Load(),
 		Errors: s.errors.Load(), Panics: s.panics.Load(), Abandoned: s.abandoned.Load(),
 	}
 }
