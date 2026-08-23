@@ -21,7 +21,7 @@
 //
 // 沒有真的鏈：Sender 是介面，Example 與測試用 fake。多個 worker 怎麼共用一條 queue、怎麼收工、怎麼不把 RPC 打爆，
 // 見 Pool 與 Throttle；同一個帳戶送出的交易在鏈上怎麼排成一列，見 OrderedSender 與 internal/txseq；
-// 送出失敗怎麼分類、放棄的 job 去哪，之後會討論。
+// 一次失敗值不值得再交付一次，見 internal/txfail 與 Worker.poison。
 package relayer
 
 import (
@@ -34,6 +34,7 @@ import (
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/intent"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/ledger"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/queue"
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txfail"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txfee"
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/txseq"
 )
@@ -91,6 +92,9 @@ const (
 	OutcomeReplaced Outcome = "replaced"
 	// OutcomeCleared：放棄這筆付款，在原本那個號上送了一筆不動錢的交易把那一格清出來，intent 推到 needs_review。Ack。
 	OutcomeCleared Outcome = "cleared"
+	// OutcomePoison：這份 job 再交付幾次結果都一樣（錯誤宣告了，或重試預算用完），停止重試。Ack。
+	// 那筆 intent 要不要跟著收尾、怎麼收尾，看它停在哪一格，見 Worker.poison。
+	OutcomePoison Outcome = "poison"
 )
 
 // Report 是處理一份 job 的結果，Run 會交給 observer、Example 會印出來。
@@ -102,6 +106,9 @@ type Report struct {
 	TxHash string
 	// Detail 是給人看的一句話：為什麼 retry、為什麼 no-op。
 	Detail string
+	// Err 是這次失敗的原因本身，給 txfail.Judge 用；Detail 是同一件事給人看的版本。
+	// 兩份都留是因為包過的錯誤要用 errors.Is 才拆得開，字串拆不動。String 不印它。
+	Err error
 }
 
 // String 用固定格式印一行：job、第幾次交付、結果、細節。
@@ -121,7 +128,8 @@ type Config struct {
 	// Lease 是一份 job 被領走後最多可以隱形多久。要比「讀 intent、寫兩次、送一次交易」的正常耗時長很多，
 	// 不然慢一點的 worker 會被當成死了。這裡設 30 秒。
 	Lease time.Duration
-	// RetryAfter 是 Nack 之後多久再交付。這裡設 5 秒。
+	// RetryAfter 是退避階梯的第一階：第一次 Nack 之後多久再交付，之後每一次加倍（見 internal/txfail）。
+	// 所以它只決定起點，不決定一份 job 最久隔多久回來。這裡設 5 秒。
 	RetryAfter time.Duration
 	// StuckAfter 是 intent 在 settling 沒有 tx hash 多久之後算「下落不明」、送去 needs_review。
 	// 要比 Lease 長：lease 過期只代表上一個 worker 沒回報，不代表它沒在送。這裡設 5 分鐘。
@@ -144,6 +152,7 @@ type Worker struct {
 	seq        txseq.Sequencer
 	cfg        Config
 	fee        txfee.Policy
+	faults     txfail.Policy
 	broadcasts Broadcasts
 	now        func() time.Time
 	observe    func(Report)
@@ -172,6 +181,9 @@ func WithLimiter(l Limiter) Option { return func(w *Worker) { w.limiter = l } }
 // WithFeePolicy 換掉替換規則（預設 txfee.DefaultPolicy）。起價、加價幅度、天花板、最多廣播幾次都在裡面。
 func WithFeePolicy(p txfee.Policy) Option { return func(w *Worker) { w.fee = p } }
 
+// WithFaultPolicy 換掉重試規則（預設 txfail.DefaultPolicy）。一份 job 最多交付幾次、退避的上限、抖不抖都在裡面。
+func WithFaultPolicy(p txfail.Policy) Option { return func(w *Worker) { w.faults = p } }
+
 // WithBroadcasts 換掉廣播紀錄本（預設一本空的 MemoryBroadcasts）。多個 worker 要共用同一本，
 // 不然重來的那個 worker 讀不到前一個 worker 送出去的東西，救援就退回成送審。
 func WithBroadcasts(b Broadcasts) Option { return func(w *Worker) { w.broadcasts = b } }
@@ -179,7 +191,7 @@ func WithBroadcasts(b Broadcasts) Option { return func(w *Worker) { w.broadcasts
 // New 建立一個 Worker。四個依賴都是介面：queue、intent store、journal、sender，今天全是記憶體版或 fake。
 func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sender, opts ...Option) *Worker {
 	w := &Worker{queue: q, intents: intents, journal: journal, sender: sender, limiter: Unlimited{},
-		seq: txseq.NewCounter(), cfg: DefaultConfig(), fee: txfee.DefaultPolicy(),
+		seq: txseq.NewCounter(), cfg: DefaultConfig(), fee: txfee.DefaultPolicy(), faults: txfail.DefaultPolicy(),
 		broadcasts: NewMemoryBroadcasts(), now: time.Now}
 	for _, o := range opts {
 		o(w)
@@ -189,8 +201,9 @@ func New(q queue.Queue, intents intent.Store, journal ledger.Journal, sender Sen
 
 // RunOnce 領一份 job、處理、然後 Ack 或 Nack。queue 空的回傳 ok=false。
 //
-// 這裡是 Outcome 對應到 queue 動作的唯一地方：sent、no-op、needs_review 三種都 Ack（這份工作結束了）；
-// retry 才 Nack。process 回錯（store 或 journal 出問題）也 Nack：錯誤本身回給呼叫端，job 留在 queue 裡等下一次。
+// 這裡是 Outcome 對應到 queue 動作的唯一地方：retry 以外的都 Ack（這份工作結束了）；retry 才 Nack，
+// 而且隔多久再交付、還要不要再交付，由 txfail.Judge 說了算。process 回錯（store 或 journal 出問題）
+// 也算一次失敗：錯誤本身回給呼叫端，job 照判決回 queue。
 // Ack 或 Nack 撞到 ErrStaleReceipt 代表我們做太慢、lease 已經被別人接走：那就什麼都不做，
 // 我們寫進 store 與 journal 的東西都是冪等的，接手的 worker 會看到、也會安靜地重放。
 func (w *Worker) RunOnce(ctx context.Context) (Report, bool, error) {
@@ -201,11 +214,26 @@ func (w *Worker) RunOnce(ctx context.Context) (Report, bool, error) {
 	rep, perr := w.process(ctx, d)
 	rep.Job, rep.Attempt = d.Job, d.Attempt
 	if perr != nil {
-		rep.Outcome, rep.Detail = OutcomeRetry, "error: "+perr.Error()
+		rep.Outcome, rep.Detail, rep.Err = OutcomeRetry, "error: "+perr.Error(), perr
+	}
+	// 失敗的 job 不再一律以同一個延遲回 queue：先判這一次值不值得再交付一次。判決是 poison 的話
+	// Nack 這條路就此結束，改由 poison 決定那份 job 與那筆 intent 各自怎麼收尾。
+	retryIn := w.cfg.RetryAfter
+	if rep.Outcome == OutcomeRetry {
+		v := w.faults.Judge(txfail.Fault{Err: rep.Err, Attempt: d.Attempt, Base: w.cfg.RetryAfter})
+		retryIn = v.Backoff
+		if v.Class == txfail.ClassPoison {
+			r, err := w.poison(ctx, d, rep, v)
+			if err != nil {
+				return rep, true, err
+			}
+			r.Job, r.Attempt = d.Job, d.Attempt
+			rep, retryIn = r, w.cfg.RetryAfter
+		}
 	}
 	var qerr error
 	if rep.Outcome == OutcomeRetry {
-		qerr = w.queue.Nack(ctx, d, w.cfg.RetryAfter, w.now())
+		qerr = w.queue.Nack(ctx, d, retryIn, w.now())
 	} else {
 		qerr = w.queue.Ack(ctx, d)
 	}
@@ -314,7 +342,7 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 				sent = txseq.SentUnknown
 			}
 			w.record(ctx, it, res, w.fee.Base, "", sent)
-			return Report{Outcome: OutcomeRetry, Detail: "send: " + serr.Error()}, nil
+			return Report{Outcome: OutcomeRetry, Detail: "send: " + serr.Error(), Err: serr}, nil
 		}
 		sent = txseq.SentYes
 		w.record(ctx, it, res, w.fee.Base, txHash, sent)

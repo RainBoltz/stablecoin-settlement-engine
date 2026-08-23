@@ -103,7 +103,7 @@ func (w *Worker) rescue(ctx context.Context, d queue.Delivery, it *intent.Intent
 			sent = txseq.SentUnknown
 		}
 		w.record(ctx, it, res, plan.Fee, "", sent)
-		return Report{Outcome: OutcomeRetry, Detail: string(plan.Kind) + ": " + serr.Error()}, nil
+		return Report{Outcome: OutcomeRetry, Detail: string(plan.Kind) + ": " + serr.Error(), Err: serr}, nil
 	}
 	sent = txseq.SentYes
 	w.record(ctx, it, res, plan.Fee, txHash, sent)
