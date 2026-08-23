@@ -176,6 +176,20 @@ re-sent as-is, never replaced. After a replacement the intent carries the hash o
 necessarily of the transaction that wins the slot. `Example_ladder` (`internal/txfee/example_test.go`) and
 `Example_replaceStuck` (`internal/relayer/example_replace_test.go`) walk through both halves.
 
+Not every failure deserves another delivery. `internal/txfail` is the smallest possible answer to that,
+and like `txfee` it touches nothing (no chain, no storage, no clock): `Judge` turns "what went wrong, which
+delivery was this, how long is the first backoff" into one of two classes. `retryable` gets an exponentially
+growing, capped, jittered delay - equal jitter, so a retry never collapses to zero and N workers do not all
+wake up in the same second. `poison` stops the redeliveries for good, either because the error said so (wrap
+`txfail.ErrPoison`) or because the delivery budget ran out; the default budget spans about ten minutes,
+deliberately longer than the relayer's five-minute `StuckAfter`, so a stuck payment gets rescued before its
+job is given up on. What happens to the payment is a separate question, and `Worker.poison` answers it from
+the intent's own state: an intent the relayer never wrote to is left alone (the job was only a note), an
+intent in `settling` whose last broadcast is known not to have been sent has its hold voided and is marked
+`failed`, and anything else goes to `needs_review` because the money may already have moved.
+`Example_budget` (`internal/txfail/example_test.go`) walks the ladder and `Example_poisonJob`
+(`internal/relayer/example_poison_test.go`) walks the three endings.
+
 The Payment Intent transition table is pinned by `backend/internal/intent/testdata/transitions.golden`;
 to change a rule, edit `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`,
 so the diff shows up in review. `go test ./internal/intent -run Example -v` walks one intent through its lifecycle.
