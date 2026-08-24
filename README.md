@@ -16,13 +16,14 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
-  one nonce line per sending account, fee-bumped replacement for stuck transactions, and a retry
-  policy that ends in a dead-letter store an operator can redrive from.
+  one nonce line per sending account, fee-bumped replacement for stuck transactions, a retry
+  policy that ends in a dead-letter store an operator can redrive from, and a chain listener that
+  settles a payment only once its chain calls the transaction irreversible.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
-The sender itself is still a fake; the real chain senders and the non-EVM chains land in their own
-directories as the series progresses.
+The sender and the watcher are still fakes; the real chain adapters and the non-EVM chains land in
+their own directories as the series progresses.
 
 ## Quick start
 
@@ -108,7 +109,8 @@ stateDiagram-v2
 
 `settled`, `failed` and `canceled` are absorbing; `needs_review` is the escape hatch, and only an
 operator gets out of it. Replaying a transition that already happened is a no-op, which is what makes
-redelivery safe everywhere else.
+redelivery safe everywhere else. The relayer owns `settling`; the listener owns `confirming`, and it is
+the only actor that can declare `settled`, because it is the only one that reads facts off the chain.
 
 The table is pinned by `backend/internal/intent/testdata/transitions.golden`; to change a rule, edit
 `Rules()` and regenerate with `cd backend && go test ./internal/intent -run Golden -update`, so the
@@ -160,6 +162,8 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `txfee` | whether a stuck transaction is worth outbidding, and by how much | `Example_ladder`, `Example_replaceStuck` |
 | `txfail` | whether a failed delivery is worth another one | `Example_budget`, `Example_poisonJob` |
 | `dlq` | where a job waits once the retries stop | `Example_redriveJob` |
+| `finality` | what "irreversible" means on each chain, as one verdict | `Example_twoRulers` |
+| `listener` | the `confirming` owner: settle, hand back or review once the chain has spoken | `Example_confirmThreeWays` |
 
 ## Design notes
 
@@ -269,6 +273,33 @@ for the relayer. `Cycles` counts the round trips, since a note that comes straig
 one more redrive away from working. `Example_redriveJob` (`internal/relayer/example_redrive_test.go`)
 sends the same three notes back and gets three different answers.
 
+### Finality and the listener
+
+A transaction in a block is not a payment that happened; on every chain there is a window in which the
+block can still be replaced. `internal/finality` turns each chain's own notion of "irreversible" into one
+`Verdict` — the `finalized` block tag on EVM, the `finalized` commitment on Solana, inclusion in a
+masterchain block on TON, a certified checkpoint on SUI — and, like `txfee` and `txfail`, it is a pure
+function: the adapter fills an `Observation` (included, at which height, how far the head is, whether the
+chain calls it final, whether it succeeded) and `Judge` answers `pending`, `final`, `failed` or `lost`.
+A `Policy` has two knobs, `RequireMarker` (wait for the chain's own marker; the default on all four chains)
+and `Confirmations` (a depth to stack on top, or to use instead of the marker — the trade Circle's CCTP
+makes public with its Fast and Standard tiers), plus `LostAfter`, how long a transaction may stay out of
+every block before it counts as dropped or reorged out. Failure is judged with the same ruler as success:
+a reverted transaction is `pending` until it is final, because until then it can still be replaced by a
+block in which it succeeds.
+
+`internal/listener` owns `confirming` and asks two questions in order. First finality, through the
+`Watcher` (the read half of a chain adapter, still a fake): `lost` hands the intent back to `settling`,
+the only backward transition in the table, and the relayer decides from `Broadcasts` whether to wait,
+replace or review. Second, only once the verdict is `final`, whether the money moved the way the intent
+said: no transfer carrying the ref (a ghost payment), or an amount that differs from the request, goes to
+`needs_review`; an exact match appends the ledger `post` and only then pushes `settled`, books first and
+state second, so dying in between replays as a no-op. The `post` is dated from the intent's own
+`UpdatedAt`, not the listener's clock, so a retry computes the identical entry and the journal treats it
+as a replay. `Example_twoRulers` (`internal/finality/example_test.go`) judges one transaction under both
+knobs and `Example_confirmThreeWays` (`internal/listener/example_test.go`) settles, hands back and
+reviews three payments.
+
 ## Repository layout
 
 <details>
@@ -330,6 +361,12 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── memory.go             # MemoryStore: park is idempotent while parked, resolve is the single atomic point
     │   ├── redrive.go            # Redrive (enqueue first, sign the record second) and Drop
     │   └── *_test.go             # Record_*, MemoryStore_* (idempotent park, new cycle, resolve once, concurrent winners), Redrive_* / Drop_*
+    ├── finality/                 # Is this transaction irreversible yet? Pure function over what the chain said: no chain, no storage, no clock
+    │   ├── finality.go           # Observation (included, height, head, final, succeeded), Policy (marker / confirmations / lost after), Defaults, Judge
+    │   └── *_test.go             # Judge_* (missing, depth, marker, both knobs, failure only once final), Defaults_*, Example_twoRulers
+    ├── listener/                 # Chain listener: owns confirming; settle + post, hand back to settling, or send to review
+    │   ├── listener.go           # Watcher (read half of a chain adapter), Sighting (observation + received amount), Listener.Check, postEntry
+    │   └── *_test.go             # Check_* (settle and post, replay after a crash, lost, ghost, mismatch, revert, no-op, race), Example_confirmThreeWays
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
