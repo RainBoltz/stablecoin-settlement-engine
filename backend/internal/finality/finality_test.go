@@ -52,7 +52,7 @@ func TestJudge_DepthIsZeroWhenTheNodeLagsBehind(t *testing.T) {
 	}
 }
 
-// TestJudge_WaitsForTheChainsOwnMarker：深度再深，marker 沒到就不算。這是預設的那把尺。
+// TestJudge_WaitsForTheChainsOwnMarker：深度再深，marker 沒到就不算。這是預設的判斷標準。
 func TestJudge_WaitsForTheChainsOwnMarker(t *testing.T) {
 	p := Defaults()["evm"]
 	obs := Observation{Included: true, Height: 100, Head: 164, Succeeded: true}
@@ -65,7 +65,7 @@ func TestJudge_WaitsForTheChainsOwnMarker(t *testing.T) {
 	}
 }
 
-// TestJudge_BothKnobsMustPass：兩個旋鈕都開就兩個都要過，marker 到了但深度不夠一樣等。
+// TestJudge_BothKnobsMustPass：兩個條件都開就兩個都要過，marker 到了但深度不夠一樣等。
 func TestJudge_BothKnobsMustPass(t *testing.T) {
 	p := Policy{Marker: "finalized", RequireMarker: true, Confirmations: 3}
 	obs := Observation{Included: true, Height: 100, Head: 101, Final: true, Succeeded: true}

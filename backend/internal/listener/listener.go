@@ -114,12 +114,12 @@ type Option func(*Listener)
 func WithClock(now func() time.Time) Option { return func(l *Listener) { l.now = now } }
 
 // WithPolicy 換掉一條鏈的不可逆規則。key 是協定名（evm、solana、ton、sui），不是 intent.Chain 整串：
-// 同一個協定的每個網路用同一把尺。
+// 同一個協定的每個網路用同一套判斷標準。
 func WithPolicy(protocol string, p finality.Policy) Option {
 	return func(l *Listener) { l.policies[protocol] = p }
 }
 
-// New 建立一個 Listener。預設用 finality.Defaults 那四把尺。
+// New 建立一個 Listener。預設用 finality.Defaults 那四套判斷標準。
 func New(intents intent.Store, journal ledger.Journal, watcher Watcher, opts ...Option) *Listener {
 	l := &Listener{intents: intents, journal: journal, watcher: watcher, policies: finality.Defaults(), now: time.Now}
 	for _, o := range opts {

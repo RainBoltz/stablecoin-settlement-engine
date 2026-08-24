@@ -8,7 +8,7 @@
 // 四條鏈的「不可逆」各是什麼（這一段是 Observation.Final 那一欄由 chain adapter 填的依據）：
 //
 //   - EVM：JSON-RPC 的 block tag 有 latest / safe / finalized 三級
-//     （https://ethereum.org/en/developers/docs/apis/json-rpc/#default-block），finalized 是 PoS 兩個 epoch、
+//     （https://ethereum.org/en/developers/docs/apis/json-rpc/#block-parameter），finalized 是 PoS 兩個 epoch、
 //     三分之二以上的 stake 投過票的區塊（https://ethereum.org/en/developers/docs/consensus-mechanisms/pos/#finality）。
 //     交易所在的區塊高度 <= finalized 的高度，就是 Final。
 //   - Solana：commitment 有 processed / confirmed / finalized 三級（https://solana.com/docs/rpc），
@@ -22,7 +22,7 @@
 // 沒有一個叫「N 個 confirmations」。數深度是 PoW 留下來的習慣，在上面四條鏈裡只有 EVM 還能拿它當 finalized 之前的代替品；
 // 而它仍然有用，因為 finalized 要等十幾分鐘，一個收款的人未必願意等那麼久。Circle 的 CCTP 就公開分成兩級
 // （https://developers.circle.com/cctp/concepts/finality-and-block-confirmations）：Fast Transfer 在 Ethereum 上等 2 個區塊，
-// Standard Transfer 等大約 65 個區塊、十幾二十分鐘。所以 Policy 有兩個旋鈕：要不要等鏈自己的 marker、要不要再壓幾個區塊。
+// Standard Transfer 等大約 65 個區塊、十幾二十分鐘。所以 Policy 有兩個條件：要不要等鏈自己的 marker、要不要再壓幾個區塊。
 // 預設全部等 marker；把 marker 關掉、只數深度，是「我願意承擔 reorg 的風險換時間」的商業決定，不是預設。
 //
 // 它跟 txfee、txfail 一樣是純函式：不碰鏈、不碰資料庫、不看時鐘。呼叫端把「鏈回了什麼、intent 進 confirming 多久了」
@@ -68,14 +68,14 @@ func (o Observation) Depth() uint64 {
 	return o.Head - o.Height + 1
 }
 
-// Policy 是一條鏈的不可逆規則，兩個旋鈕加一個逾時。
+// Policy 是一條鏈的不可逆規則，兩個條件加一個逾時。
 type Policy struct {
 	// Marker 是這條鏈自己的「不可逆」叫什麼名字（finalized、masterchain、checkpoint），只用來印理由。
 	Marker string
 	// RequireMarker：要等鏈自己說不可逆（Observation.Final）。預設開；關掉就只剩深度。
 	RequireMarker bool
 	// Confirmations：至少要有幾個區塊壓在上面（含自己）才算，0 代表不看深度。
-	// 這是 Circle 那種「Fast Transfer」的旋鈕：Ethereum 上等 2 個區塊就放行。它可以跟 RequireMarker 疊加，
+	// 這是 Circle 那種「Fast Transfer」的條件：Ethereum 上等 2 個區塊就放行。它可以跟 RequireMarker 疊加，
 	// 兩個都開就是兩個都要滿足。
 	Confirmations uint64
 	// LostAfter：intent 進 confirming 之後多久還沒在任何區塊裡，就當成被吐回來或被丟掉，交回 relayer。
@@ -148,7 +148,7 @@ func (v Verdict) String() string { return fmt.Sprintf("%-8s %s", v.Kind, v.Reaso
 //  4. 到這裡它已經不可逆了，才看執行成功還是失敗。
 //
 // 第 4 條擺最後是這棵樹最重要的決定：一筆 revert 的交易在 finalized 之前跟一筆成功的交易一樣可以被 reorg 換掉，
-// 換掉之後同一筆交易可能在另一個區塊裡成功。「鏈上說失敗」跟「鏈上說成功」要用同一把尺量，都要等它不可逆才能信；
+// 換掉之後同一筆交易可能在另一個區塊裡成功。「鏈上說失敗」跟「鏈上說成功」都要等它不可逆才能信；
 // 早一步把它送去人工介入，人看到的會是一張可能翻盤的照片。
 func (p Policy) Judge(obs Observation, age time.Duration) Verdict {
 	if !obs.Included {
@@ -164,7 +164,7 @@ func (p Policy) Judge(obs Observation, age time.Duration) Verdict {
 	if p.RequireMarker && !obs.Final {
 		return Verdict{Kind: KindPending, Reason: fmt.Sprintf("included at %d, %d deep, not yet %s", obs.Height, depth, p.Marker)}
 	}
-	// 理由裡寫的是「憑什麼算不可逆」：等 marker 的寫 marker，只數深度的寫深度。人看理由就知道這條鏈用的是哪一種尺。
+	// 理由裡寫的是「憑什麼算不可逆」：等 marker 的寫 marker，只數深度的寫深度。人看理由就知道這條鏈用的是哪一個判斷標準。
 	where := fmt.Sprintf("%d confirmations at %d", depth, obs.Height)
 	if p.RequireMarker {
 		where = fmt.Sprintf("%s at %d, %d deep", p.Marker, obs.Height, depth)

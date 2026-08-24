@@ -7,7 +7,7 @@ import (
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/finality"
 )
 
-// Example_twoRulers 是同一筆 EVM 交易、兩把尺：
+// Example_twoRulers 是同一筆 EVM 交易、兩個判斷標準：
 //
 //   - fast 只數深度，壓 2 個區塊就算（Circle 的 Fast Transfer 在 Ethereum 上就是這個數字）。
 //   - hard 等鏈自己的 finalized tag，預設就是它。

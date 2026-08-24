@@ -268,7 +268,7 @@ func TestCheck_RefusesAChainWithoutAPolicy(t *testing.T) {
 	}
 }
 
-// TestCheck_UsesThePolicyOfTheIntentsProtocol：規則以協定名為 key。把 evm 換成只數 2 個區塊的尺之後，
+// TestCheck_UsesThePolicyOfTheIntentsProtocol：規則以協定名為 key。把 evm 換成只數 2 個區塊的判斷標準之後，
 // 同一個 Observation 在 evm:31337 上是 settled，在 solana:mainnet 上照預設還在等 finalized。
 func TestCheck_UsesThePolicyOfTheIntentsProtocol(t *testing.T) {
 	ctx := context.Background()
