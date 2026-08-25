@@ -11,9 +11,11 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 **What exists today**
 
 - **On-chain** — the `Settlement` contract (one settlement path behind a pull door and a push door,
-  with a per-ref replay guard), a mock token zoo that reproduces real ERC-20 misbehaviour
-  (no return value, approve races, transfer fees, blacklists), a one-command local devnet, and
-  mainnet-fork tests that check the mocks against the real thing.
+  with a per-ref replay guard) moving money through a `SafeTransfer` wrapper that accepts every
+  answer a real token gives — a boolean, nothing at all, a revert — a mock token zoo that
+  reproduces real ERC-20 misbehaviour (no return value, approve races, transfer fees, blacklists),
+  a one-command local devnet, and mainnet-fork tests that check the mocks — and the wrapper —
+  against the real thing.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
@@ -340,6 +342,23 @@ go payer → merchant directly and never rest in the contract), no received-amou
 `Settlement.t.sol` (`contracts/evm/test/`) pins both doors, the replay guard — reentrant token
 included — and how each of the four misbehaviour classes fares on the way through.
 
+### The safe transfer wrapper
+
+One of those classes used to take the whole contract down with it: mainnet USDT returns nothing
+from `transferFrom`, the standard `IERC20` call dies decoding the missing boolean, and even a
+successful transfer cannot get through — the biggest stablecoin simply did not work here.
+`contracts/evm/src/libraries/SafeTransfer.sol` owns the calling convention and nothing else:
+a low-level call whose return data is read by hand, collapsing the three answers a real token
+can give (a revert, `false`, nothing at all) into one meaning — revert unless the money moved.
+A token's own revert reason is forwarded untouched, because *who* refused a transfer is what
+off-chain failure classification reads; `false` becomes a loud revert instead of a ghost payment;
+and empty return data is only trusted after a code-existence check, since a low-level call to an
+address without code also "succeeds" with nothing to say. It is the minimal subset of
+OpenZeppelin's `SafeERC20` — `transfer` and `transferFrom` only, no approve helpers, because
+nothing in this repo approves anyone — written from scratch like everything else here.
+`SafeTransfer.t.sol` pins all three answer shapes plus the no-code guard, and
+`test/fork/SafeTransferMainnet.t.sol` replays the wrapper against the real USDT on a mainnet fork.
+
 ## Repository layout
 
 <details>
@@ -427,6 +446,8 @@ contracts/
     │   ├── Settlement.sol        # One settlement path, two doors: pull (relayer allowlist) and push; per-ref replay guard
     │   ├── interfaces/
     │   │   └── IERC20.sol        # Minimal EIP-20 interface, written from the spec
+    │   ├── libraries/
+    │   │   └── SafeTransfer.sol  # Transfer via low-level call: revert forwarded, false caught, empty returndata needs code
     │   └── mocks/                # Mock token zoo: real-world ERC-20 misbehaviour
     │       ├── ERC20Mock.sol             # Fully compliant baseline
     │       ├── USDTMock.sol              # No return value, approve race lock, fee, blacklist, pause
@@ -440,10 +461,12 @@ contracts/
     ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
     └── test/
         ├── Settlement.t.sol      # Both doors, the replay guard (reentrant token included), the four classes passing through
+        ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
         ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
         ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
         └── fork/
-            └── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
+            ├── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
+            └── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
 ```
 
 </details>
