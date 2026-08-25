@@ -5,6 +5,8 @@ import (
 	"errors"
 	"testing"
 	"time"
+
+	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
 )
 
 // TestMemoryStore_SaveIsCompareAndSwap：兩個 worker 各自讀到同一個版本、各自推進，只有一個寫得回去。
@@ -94,5 +96,35 @@ func TestAdvance_ReadApplySave(t *testing.T) {
 	}
 	if _, _, err := Advance(ctx, s, "nope", Request{To: StateAuthorized, By: ActorAPI}); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("want ErrNotFound, got %v", err)
+	}
+}
+
+// TestMemoryStore_ByState：對帳引擎靠它找出「還沒有人推它」的 intent。查幾個狀態就回幾個狀態的 intent、依 ID 排序、
+// 回的是拷貝；查一個沒有人停著的狀態回空的，不是錯誤。
+func TestMemoryStore_ByState(t *testing.T) {
+	ctx := context.Background()
+	s := NewMemoryStore()
+	for _, id := range []string{"pi_b", "pi_a", "pi_c"} {
+		it := newTestIntent(t)
+		it.ID = id
+		it.Ref = paymentref.Derive(it.Terms())
+		_ = s.Save(ctx, it, 0)
+	}
+	_, _, _ = Advance(ctx, s, "pi_c", Request{To: StateAuthorized, By: ActorAPI, At: t0})
+
+	got, err := s.ByState(ctx, StateCreated)
+	if err != nil || len(got) != 2 || got[0].ID != "pi_a" || got[1].ID != "pi_b" {
+		t.Fatalf("created: got %v, %v", got, err)
+	}
+	got, _ = s.ByState(ctx, StateAuthorized, StateCreated)
+	if len(got) != 3 || got[2].ID != "pi_c" || got[2].State != StateAuthorized {
+		t.Fatalf("authorized + created: got %d, last %+v", len(got), got[2])
+	}
+	got[0].State = StateFailed
+	if it, _ := s.Get(ctx, "pi_a"); it.State != StateCreated {
+		t.Fatal("ByState must return copies")
+	}
+	if got, _ := s.ByState(ctx, StateSettled); len(got) != 0 {
+		t.Fatalf("settled: got %d, want none", len(got))
 	}
 }

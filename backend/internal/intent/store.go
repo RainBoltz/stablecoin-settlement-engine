@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sort"
 	"sync"
 
 	"github.com/RainBoltz/stablecoin-settlement-engine/backend/internal/paymentref"
@@ -37,6 +38,10 @@ type Store interface {
 	// Save 只在存的那份 Version 等於 expectedVersion 時寫入；新 intent 用 expectedVersion=0。
 	// 寫入前會用 intent 自己的條件重算 Ref，對不上就是 ErrRefMismatch。
 	Save(ctx context.Context, it *Intent, expectedVersion uint64) error
+	// ByState 列出停在這幾個狀態的 intent，依 ID 排序，回傳的都是拷貝。
+	// 這是給對帳引擎掃「還沒有人推它」的 intent 用的：資料庫版就是一句 WHERE state IN (...)。
+	// terminal 狀態也可以查，但沒有人該拿它們做事。
+	ByState(ctx context.Context, states ...State) ([]*Intent, error)
 }
 
 // MemoryStore 是給測試與本地開發用的 Store。
@@ -71,6 +76,23 @@ func (s *MemoryStore) GetByRef(_ context.Context, ref paymentref.Ref) (*Intent, 
 		return nil, fmt.Errorf("%w: ref %s", ErrNotFound, ref)
 	}
 	return s.m[id].Clone(), nil
+}
+
+// ByState 實作 Store。依 ID 排序是為了讓掃描的順序固定，對帳的輸出才測得動；資料庫版靠 ORDER BY 做同一件事。
+func (s *MemoryStore) ByState(_ context.Context, states ...State) ([]*Intent, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var out []*Intent
+	for _, it := range s.m {
+		for _, st := range states {
+			if it.State == st {
+				out = append(out, it.Clone())
+				break
+			}
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
 }
 
 // Save 實作 Store。先做 CAS，再核對 ref：版本衝突是常態、先擋掉便宜；ref 對不上是異常，擋在寫入之前。
