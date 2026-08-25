@@ -10,12 +10,12 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 
 **What exists today**
 
-- **On-chain** — the `Settlement` contract (one settlement path behind a pull door and a push door,
-  with a per-ref replay guard) moving money through a `SafeTransfer` wrapper that accepts every
-  answer a real token gives — a boolean, nothing at all, a revert — a mock token zoo that
-  reproduces real ERC-20 misbehaviour (no return value, approve races, transfer fees, blacklists),
-  a one-command local devnet, and mainnet-fork tests that check the mocks — and the wrapper —
-  against the real thing.
+- **On-chain** — the `Settlement` contract (one settlement path behind three doors — pull, push, and
+  a signature-based pull that spends no allowance — with a per-ref replay guard) moving money
+  through a `SafeTransfer` wrapper that accepts every answer a real token gives — a boolean,
+  nothing at all, a revert — a mock token zoo that reproduces real ERC-20 misbehaviour (no return
+  value, approve races, transfer fees, blacklists), a one-command local devnet, and mainnet-fork
+  tests that check the mocks — the wrapper and the Permit2 path included — against the real thing.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
@@ -359,6 +359,28 @@ nothing in this repo approves anyone — written from scratch like everything el
 `SafeTransfer.t.sol` pins all three answer shapes plus the no-code guard, and
 `test/fork/SafeTransferMainnet.t.sol` replays the wrapper against the real USDT on a mainnet fork.
 
+### Signature-based approval
+
+Both doors still opened the same way: the payer sends an `approve` first, granting an allowance that
+has nothing to do with the payment it was meant for and outlives it. `settleWithPermit()` is a third
+door that takes an off-chain EIP-712 signature instead, routed through
+[Permit2](https://docs.uniswap.org/contracts/permit2/overview) — the singleton Uniswap deployed at
+the same address on every chain. `src/interfaces/ISignatureTransfer.sol` is the minimal slice of it
+this repo speaks: one call, `permitWitnessTransferFrom`, from the `SignatureTransfer` half, where a
+signature moves money once and leaves nothing behind, rather than the `AllowanceTransfer` half,
+which is still an allowance with an expiry. The witness is what turns that signature into a payment
+authorization instead of a spending limit: Permit2 signs `(token, amount, spender, nonce, deadline)`
+and nothing more, so the recipient is whatever the spender fills in at call time; this contract
+hashes `Payment(bytes32 ref,address merchant)` into the signed struct, so a relayer that redirects
+the money — or rounds the amount up — produces a digest the payer never signed. The PaymentRef
+doubles as the Permit2 nonce, which is an unordered bitmap rather than a sequence: no second
+identifier to mint, and re-requesting a signature for the same intent yields the same bytes. What
+did not go away is the one-time `approve` to Permit2 itself, once per token, and a contract nobody
+here wrote now sits on the money path. `SettlementPermit2.t.sol` pins what the signature binds —
+merchant, amount, spender, deadline, nonce — against `test/mocks/Permit2Mock.sol`, and
+`test/fork/SettlementPermit2Mainnet.t.sol` replays the same signature against the real Permit2 on a
+mainnet fork.
+
 ## Repository layout
 
 <details>
@@ -443,9 +465,10 @@ contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
     ├── src/
-    │   ├── Settlement.sol        # One settlement path, two doors: pull (relayer allowlist) and push; per-ref replay guard
+    │   ├── Settlement.sol        # One settlement path, three doors: pull, push, signature-based pull; per-ref replay guard
     │   ├── interfaces/
-    │   │   └── IERC20.sol        # Minimal EIP-20 interface, written from the spec
+    │   │   ├── IERC20.sol        # Minimal EIP-20 interface, written from the spec
+    │   │   └── ISignatureTransfer.sol # Permit2's signature-transfer half: permitWitnessTransferFrom and the nonce bitmap
     │   ├── libraries/
     │   │   └── SafeTransfer.sol  # Transfer via low-level call: revert forwarded, false caught, empty returndata needs code
     │   └── mocks/                # Mock token zoo: real-world ERC-20 misbehaviour
@@ -460,19 +483,24 @@ contracts/
     │   └── SeedDevnet.s.sol      # run(): read the json, broadcast the world state
     ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
     └── test/
-        ├── Settlement.t.sol      # Both doors, the replay guard (reentrant token included), the four classes passing through
+        ├── Settlement.t.sol      # The allowance doors, the replay guard (reentrant token included), the four classes passing through
+        ├── SettlementPermit2.t.sol # The signature door: what the signature binds, and the shared replay guard
         ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
         ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
         ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
+        ├── mocks/
+        │   └── Permit2Mock.sol   # Offline stand-in for Permit2: same EIP-712 digest, same nonce bitmap, same error order
         └── fork/
             ├── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
-            └── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
+            ├── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
+            └── SettlementPermit2Mainnet.t.sol # The same signature against the real Permit2 (needs ETH_RPC_URL)
 ```
 
 </details>
 
-The mocks live under `src/` rather than `test/` on purpose: the devnet deployment scripts
-and the relayer integration tests reuse them.
+The token mocks live under `src/` rather than `test/` on purpose: the devnet deployment scripts
+and the relayer integration tests reuse them. `test/mocks/` is for stand-ins of other people's
+protocols, which nothing outside the test suite has any business deploying.
 
 ## Safety
 
