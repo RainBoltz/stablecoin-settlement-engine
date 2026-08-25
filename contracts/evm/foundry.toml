@@ -11,7 +11,7 @@ optimizer = true
 optimizer_runs = 200
 
 # 這個專案刻意維持零外部依賴，只用 forge-std。
-# ERC-20 的安全包裝（SafeERC20 之類）之後再談，現在要先讓陷阱裸露出來。
+# ERC-20 的安全包裝也自己寫：src/libraries/SafeTransfer.sol，照 SafeERC20 的公開行為實作最小子集。
 remappings = ["forge-std/=lib/forge-std/src/"]
 
 # Day 3：部署腳本會把地址寫進 deployments/<chainId>.json。
