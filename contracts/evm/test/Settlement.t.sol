@@ -51,7 +51,7 @@ contract ReentrantToken {
 }
 
 /// @title SettlementTest
-/// @notice 把 Settlement 的兩個入口、replay 防護與「穿過它的四類例外」全部釘死。
+/// @notice 把 Settlement 的兩個入口、replay 防護與「四類例外經過它的結果」全部釘死。
 /// @dev 這些測試同時是這份合約的行為規格：哪些失敗是安全的（revert、什麼都沒動）、
 ///      哪些成功是帶著已知缺陷的（fee-on-transfer 的實收短少留給鏈下）。
 contract SettlementTest is Test {
@@ -167,8 +167,8 @@ contract SettlementTest is Test {
     // replay 防護：同一個 ref 只結算一次
     // ====================================================================
 
-    /// @dev 「錢只動一次」在鏈上的那一格 storage：第二次拿同一個 ref 來，不管金額、
-    ///      token、收款人是什麼，一律拒絕。
+    /// @dev 「錢只動一次」在鏈上的實體是 paid 這筆標記：第二次拿同一個 ref 來，
+    ///      不管金額、token、收款人是什麼，一律拒絕。
     function test_settle_sameRefPaysOnlyOnce() public {
         approveSettlement(address(usdc), AMOUNT * 2);
 
@@ -251,45 +251,64 @@ contract SettlementTest is Test {
         settlement.settle(address(usdc), payer, merchant, 0, REF);
     }
 
-    /// @dev token 位址上沒有程式碼的話整筆 revert：Solidity 對「預期有回傳值」的外部呼叫
-    ///      會先檢查對方有沒有 code，對一個 EOA 呼叫 transferFrom 不會安靜地成功。
+    /// @dev token 位址上沒有程式碼的話整筆 revert。以前這件事靠編譯器（標準介面的呼叫
+    ///      會先查對方有沒有 code），改走低階 call 之後編譯器不查了，SafeTransfer 自己查。
     function test_settle_revertsWhenTokenHasNoCode() public {
         vm.prank(relayer);
-        vm.expectRevert();
+        vm.expectRevert(bytes("SafeTransfer: token has no code"));
         settlement.settle(makeAddr("not-a-token"), payer, merchant, AMOUNT, REF);
     }
 
     // ====================================================================
-    // 四類例外穿過這份合約
+    // 把這份合約帶入 token 的四類例外
     // ====================================================================
 
-    /// @dev 「不會 revert 的」：token 用回傳 false 表達失敗，require(ok) 把它轉成明確的
-    ///      revert。少了這一行，event 照發、錢沒動，就是 Day 2 的幽靈支付。
+    /// @dev 「不會 revert 的」：token 用回傳 false 表達失敗，SafeTransfer 把它轉成明確的
+    ///      revert。少了這一層，event 照發、錢沒動，就是 Day 2 的幽靈支付。
     function test_settle_noRevertTokenFalseIsCaught() public {
         NoRevertERC20Mock bad = new NoRevertERC20Mock("No Revert USD", "NRUSD", 18);
         // 刻意不給 allowance：這顆 token 會回傳 false 而不是 revert
 
         vm.prank(relayer);
-        vm.expectRevert(bytes("Settlement: transferFrom returned false"));
+        vm.expectRevert(bytes("SafeTransfer: transfer returned false"));
         settlement.settle(address(bad), payer, merchant, AMOUNT, REF);
         assertFalse(settlement.paid(REF), "nothing moved, nothing marked");
     }
 
-    /// @dev 「會 revert 的」：USDT 的 transferFrom 沒有回傳值，標準介面在解碼那一步 revert，
-    ///      連 USDT 內部已經更新的帳一起回滾。失敗是安全的，但也代表 USDT 今天完全過不了
-    ///      這份合約——這就是標準介面的邊界。
-    function test_settle_usdtRevertsThroughStandardInterface() public {
+    /// @dev USDT 的 transferFrom 沒有回傳值，標準介面在解碼那一步 revert，連成功的轉帳
+    ///      都過不了；換上 SafeTransfer 之後，市值最大的穩定幣走得完這份合約了。
+    function test_settle_usdtStyleTokenSettles() public {
         vm.prank(owner);
         USDTMock usdt = new USDTMock();
         usdt.mint(payer, PAYER_SEED);
         vm.prank(payer);
         usdt.approve(address(settlement), AMOUNT);
 
+        vm.expectEmit(true, true, true, true, address(settlement));
+        emit Settlement.Paid(REF, payer, merchant, address(usdt), AMOUNT, relayer);
+
         vm.prank(relayer);
-        vm.expectRevert();
         settlement.settle(address(usdt), payer, merchant, AMOUNT, REF);
 
-        assertEq(usdt.balanceOf(payer), PAYER_SEED, "the revert rolls USDT's move back too");
+        assertEq(usdt.balanceOf(payer), PAYER_SEED - AMOUNT, "payer pays");
+        assertEq(usdt.balanceOf(merchant), AMOUNT, "merchant receives");
+        assertTrue(settlement.paid(REF), "ref is marked paid");
+    }
+
+    /// @dev 「永遠失敗的」：黑名單在 token 裡擋，SafeTransfer 把 token 自己的 revert 原因
+    ///      原封不動轉發上來，鏈下才分得出這筆失敗是不用再試的那一種；ref 不被燒掉。
+    function test_settle_usdtBlacklistReasonBubblesUp() public {
+        vm.prank(owner);
+        USDTMock usdt = new USDTMock();
+        usdt.mint(payer, PAYER_SEED);
+        vm.prank(payer);
+        usdt.approve(address(settlement), AMOUNT);
+        vm.prank(owner);
+        usdt.addBlackList(payer);
+
+        vm.prank(relayer);
+        vm.expectRevert(bytes("USDTMock: from is blacklisted"));
+        settlement.settle(address(usdt), payer, merchant, AMOUNT, REF);
         assertFalse(settlement.paid(REF), "ref is not burned");
     }
 

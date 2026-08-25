@@ -2,13 +2,14 @@
 pragma solidity ^0.8.26;
 
 import {IERC20} from "./interfaces/IERC20.sol";
+import {SafeTransfer} from "./libraries/SafeTransfer.sol";
 
 /// @title Settlement
 /// @notice 結算合約：搬錢的同時，把 PaymentRef 帶上鏈。
 /// @dev 本合約為本系列從零設計，只取公開設計裡需要的那部分。
 ///
-///      它要解的第一個問題不是搬錢——token 合約自己就會搬——而是 EVM 的 ERC-20 轉帳
-///      沒有 memo 欄位：一筆裸的 transfer 上鏈之後，沒有任何地方寫著它是為了哪一筆付款，
+///      它要解的第一個問題是 EVM 的 ERC-20 轉帳沒有 memo 欄位（搬錢本身 token 合約
+///      就會做）：一筆裸的 transfer 上鏈之後，沒有任何地方寫著它是為了哪一筆付款，
 ///      對帳引擎只能把它列成 unreferenced 等人工找回。錢繞經這份合約，ref 才有地方
 ///      以 event 的形式上鏈，listener 與對帳引擎才有東西可撈。
 ///      公開的前例是 Request Network 的 ERC20FeeProxy：把 paymentReference 當參數傳進
@@ -36,13 +37,15 @@ import {IERC20} from "./interfaces/IERC20.sol";
 ///        合約信任 relayer 名單」，名單上的 relayer 在額度內可以發起任何付款；
 ///        把授權收窄到「payer 對單筆付款簽名」的方案之後再談。
 contract Settlement {
+    using SafeTransfer for IERC20;
+
     /// @notice 部署者，唯一的權限是管理 relayer 名單。
     address public immutable owner;
 
     /// @notice pull 支付流的准入名單：只有名單上的地址能呼叫 settle()。
     mapping(address => bool) public isRelayer;
 
-    /// @notice 已經結算過的 ref。一格 storage 換一個鏈上保證：同一筆付款不會走完第二次。
+    /// @notice 已經結算過的 ref。一筆 storage 寫入換一個鏈上保證：同一筆付款不會走完第二次。
     mapping(bytes32 => bool) public paid;
 
     /// @notice 錢在這筆交易裡動了。刻意不叫 Settled：鏈下 intent 的 `settled` 要等
@@ -100,9 +103,10 @@ contract Settlement {
     ///      是「ref already paid」。失敗的情況不用擔心標記殘留——transferFrom 一 revert，
     ///      整筆交易連同標記一起回滾，ref 不會被一次失敗的嘗試燒掉。
     ///
-    ///      transferFrom 的回傳值一定要檢查：EIP-20 允許 token 用回傳 false 代替 revert
-    ///      （https://eips.ethereum.org/EIPS/eip-20），不檢查的話這種失敗會安靜地過，
-    ///      event 照發、鏈下照對帳，一筆錢沒動的付款就成了幽靈支付。
+    ///      搬錢走 SafeTransfer 而非標準介面：token 對一筆轉帳可能 revert、可能回傳
+    ///      false（EIP-20 允許，https://eips.ethereum.org/EIPS/eip-20）、成功時也可能
+    ///      什麼都不回（主網 USDT）。SafeTransfer 把三種回應收斂成「沒成功就 revert」，
+    ///      所以走到 emit 那一行時，錢一定動過了。
     function _settle(address token, address payer, address merchant, uint256 amount, bytes32 ref) private {
         require(ref != bytes32(0), "Settlement: ref is zero");
         require(merchant != address(0), "Settlement: merchant is the zero address");
@@ -110,8 +114,7 @@ contract Settlement {
         require(!paid[ref], "Settlement: ref already paid");
         paid[ref] = true;
 
-        bool ok = IERC20(token).transferFrom(payer, merchant, amount);
-        require(ok, "Settlement: transferFrom returned false");
+        IERC20(token).safeTransferFrom(payer, merchant, amount);
 
         emit Paid(ref, payer, merchant, token, amount, msg.sender);
     }
