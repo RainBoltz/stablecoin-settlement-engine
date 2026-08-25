@@ -17,13 +17,14 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
   one nonce line per sending account, fee-bumped replacement for stuck transactions, a retry
-  policy that ends in a dead-letter store an operator can redrive from, and a chain listener that
-  settles a payment only once its chain calls the transaction irreversible.
+  policy that ends in a dead-letter store an operator can redrive from, a chain listener that
+  settles a payment only once its chain calls the transaction irreversible, and a reconciliation
+  engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
-The sender and the watcher are still fakes; the real chain adapters and the non-EVM chains land in
-their own directories as the series progresses.
+The sender, the watcher and the recon source are still fakes; the real chain adapters and the
+non-EVM chains land in their own directories as the series progresses.
 
 ## Quick start
 
@@ -164,6 +165,7 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `dlq` | where a job waits once the retries stop | `Example_redriveJob` |
 | `finality` | what "irreversible" means on each chain, as one verdict | `Example_twoRulers` |
 | `listener` | the `confirming` owner: settle, hand back or review once the chain has spoken | `Example_confirmThreeWays` |
+| `recon` | the audit over a finalized window: sweep the open intents, match transfers by ref, file findings | `Example_reconcileWindow` |
 
 ## Design notes
 
@@ -300,6 +302,25 @@ as a replay. `Example_twoRulers` (`internal/finality/example_test.go`) judges on
 knobs and `Example_confirmThreeWays` (`internal/listener/example_test.go`) settles, hands back and
 reviews three payments.
 
+### Reconciliation
+
+The listener answers "is this transaction settled yet", one intent at a time, through the hash the
+intent already carries. What nobody answered so far is the outer join: does every finalized transfer
+that concerns us map back to exactly one intent, and is someone actually driving every open intent.
+`internal/recon` owns that audit and nothing else — it adds evidence and files findings, and never
+declares `settled` or `failed` itself; judgement stays where it lives, in `finality.Judge`, the
+listener and the operator. Each `Run` first sweeps the off-chain side — `authorized` and `settling`
+intents get their `settle` job re-enqueued (idempotent, and a job parked in the dlq is left to a
+person), `confirming` intents are handed to `listener.Check` — and then reconciles a window of chain
+history whose upper bound is the chain's own finalized height, so a finding can never be un-happened
+by a reorg. Transfers are matched by ref: a matched transfer must agree with the ledger's `post`; a
+`settling` intent whose relayer died between broadcasting and writing the hash back gets the hash
+filled in through the transition table's own `listener` rows; everything else becomes one of five
+findings — `unknown_ref`, `unreferenced`, `paid_twice`, `unexpected`, `mismatch` — each naming the
+transfer, the intent and why a person should look. The cursor only advances after a clean run, and
+replaying a window is a no-op by construction. `Example_reconcileWindow`
+(`internal/recon/example_test.go`) walks five payments and seven transfers through one run.
+
 ## Repository layout
 
 <details>
@@ -320,7 +341,7 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── state.go              # State / Actor / Rule and the transition table (Rules())
     │   ├── intent.go             # Intent (ID + Ref), Transition (history entry), New() derives the Ref, Terms()
     │   ├── machine.go            # Apply(): replay is a no-op, terminal is absorbing, actor + evidence checks
-    │   ├── store.go              # Store interface (CAS Save that re-derives the Ref, Get, GetByRef), MemoryStore, Advance()
+    │   ├── store.go              # Store interface (CAS Save that re-derives the Ref, Get, GetByRef, ByState), MemoryStore, Advance()
     │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
     │   ├── testdata/transitions.golden
     │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, ref_test.go, Example_lifecycle
@@ -367,6 +388,10 @@ backend/                          # Go module (stdlib only so far), go 1.24
     ├── listener/                 # Chain listener: owns confirming; settle + post, hand back to settling, or send to review
     │   ├── listener.go           # Watcher (read half of a chain adapter), Sighting (observation + received amount), Listener.Check, postEntry
     │   └── *_test.go             # Check_* (settle and post, replay after a crash, lost, ghost, mismatch, revert, no-op, race), Example_confirmThreeWays
+    ├── recon/                    # Reconciliation engine: sweep the intents nobody is driving, match a finalized window of transfers by ref
+    │   ├── recon.go              # Transfer, Source (read half of a chain adapter, by height range), Kind (the five findings), Finding / Match / Sweep, Report
+    │   ├── engine.go             # Engine.Run: sweep, then reconcile cursor+1..finalized; the cursor moves only after a clean run
+    │   └── *_test.go             # Run_* (sweep enqueue / parked / confirming, fill in the hash, swap the hash, the five findings, window, replay no-op, race), Example_reconcileWindow
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
