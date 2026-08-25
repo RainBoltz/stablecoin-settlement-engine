@@ -354,7 +354,7 @@ func (w *Worker) process(ctx context.Context, d queue.Delivery) (Report, error) 
 		sent = txseq.SentYes
 		w.record(ctx, it, res, w.fee.Base, txHash, sent)
 		// 這裡若寫不回去（store 掛了），交易已經在路上、intent 卻停在 settling：下一次交付會走 settling 那一格，
-		// 最後由人（或之後的 listener）拿著鏈上的 ref 對回來。今天先接受這個洞。
+		// 最後由對帳引擎拿著鏈上的 ref 對回來、把 hash 補進 confirming（見 internal/recon）。
 		if err := w.advance(ctx, it, intent.Request{To: intent.StateConfirming, By: intent.ActorRelayer, TxHash: txHash, At: w.now()}); err != nil {
 			return Report{}, err
 		}

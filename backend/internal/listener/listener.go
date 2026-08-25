@@ -15,8 +15,8 @@
 // 一筆 finalized 的交易可以一毛錢都沒動（Day 2 那種回傳 false 的 token），finality 過了只代表這個結果不會再變。
 //
 // 跟鏈的接口是 Watcher，今天只有測試用的 fake；接真的鏈時 chain adapter 讀取的那一半實作它。
-// 誰負責把 confirming 的 intent 交給 Check（掃 store、或訂閱鏈上事件），跟「鏈上動過的錢是不是都對得回 intent」
-// 是同一件事，之後跟對帳一起討論。
+// 把 confirming 的 intent 交給 Check 的是對帳引擎的鏈下掃描，「鏈上動過的錢是不是都對得回 intent」也是它對的，
+// 見 internal/recon。
 package listener
 
 import (
