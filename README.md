@@ -10,7 +10,8 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 
 **What exists today**
 
-- **On-chain** — EVM contracts, a mock token zoo that reproduces real ERC-20 misbehaviour
+- **On-chain** — the `Settlement` contract (one settlement path behind a pull door and a push door,
+  with a per-ref replay guard), a mock token zoo that reproduces real ERC-20 misbehaviour
   (no return value, approve races, transfer fees, blacklists), a one-command local devnet, and
   mainnet-fork tests that check the mocks against the real thing.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
@@ -321,6 +322,24 @@ transfer, the intent and why a person should look. The cursor only advances afte
 replaying a window is a no-op by construction. `Example_reconcileWindow`
 (`internal/recon/example_test.go`) walks five payments and seven transfers through one run.
 
+### The settlement contract
+
+One of those findings — `unreferenced` — exists because a bare ERC-20 `transfer` has nowhere to
+carry a ref: the EVM has no memo field. `contracts/evm/src/Settlement.sol` is that memo field.
+Money routed through it reaches the merchant in the same transaction that emits a `Paid` event
+carrying the ref, which is exactly what the listener and the reconciliation engine read back.
+One private `_settle` path sits behind two doors: `settle()` is the pull flow — the relayer
+initiates and pays gas, spending the allowance the payer granted the contract beforehand, gated
+by a relayer allowlist so nobody else can spend that allowance — and `pay()` is the push flow,
+for a payer who skips the relayer but still needs a place to put the ref. The ref is marked in
+`paid` *before* the token is touched, so a reentrant token replaying the ref hits
+`ref already paid`; the boolean `transferFrom` returns is checked, so a false-returning token
+fails loud instead of ghosting. The contract deliberately owns nothing else: no custody (funds
+go payer → merchant directly and never rest in the contract), no received-amount measurement
+(that judgement lives off-chain, in the listener), no per-payment authorization yet.
+`Settlement.t.sol` (`contracts/evm/test/`) pins both doors, the replay guard — reentrant token
+included — and how each of the four misbehaviour classes fares on the way through.
+
 ## Repository layout
 
 <details>
@@ -405,6 +424,7 @@ contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
     ├── src/
+    │   ├── Settlement.sol        # One settlement path, two doors: pull (relayer allowlist) and push; per-ref replay guard
     │   ├── interfaces/
     │   │   └── IERC20.sol        # Minimal EIP-20 interface, written from the spec
     │   └── mocks/                # Mock token zoo: real-world ERC-20 misbehaviour
@@ -419,6 +439,7 @@ contracts/
     │   └── SeedDevnet.s.sol      # run(): read the json, broadcast the world state
     ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
     └── test/
+        ├── Settlement.t.sol      # Both doors, the replay guard (reentrant token included), the four classes passing through
         ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
         ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
         └── fork/
