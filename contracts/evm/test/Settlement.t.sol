@@ -4,6 +4,7 @@ pragma solidity ^0.8.26;
 import {Test} from "forge-std/Test.sol";
 
 import {Settlement} from "../src/Settlement.sol";
+import {Permit2Mock} from "./mocks/Permit2Mock.sol";
 import {ERC20Mock} from "../src/mocks/ERC20Mock.sol";
 import {FeeOnTransferERC20Mock} from "../src/mocks/FeeOnTransferERC20Mock.sol";
 import {NoRevertERC20Mock} from "../src/mocks/NoRevertERC20Mock.sol";
@@ -78,8 +79,11 @@ contract SettlementTest is Test {
         outsider = makeAddr("outsider");
         feeCollector = makeAddr("feeCollector");
 
+        // 這一檔測的是 allowance 版的兩個入口，Permit2 那條路徑由 SettlementPermit2.t.sol 負責，
+        // 這裡只是給 constructor 一個真的有 code 的位址。
+        Permit2Mock permit2 = new Permit2Mock();
         vm.prank(owner);
-        settlement = new Settlement();
+        settlement = new Settlement(address(permit2));
         vm.prank(owner);
         settlement.setRelayer(relayer, true);
 
