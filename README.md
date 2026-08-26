@@ -10,12 +10,13 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 
 **What exists today**
 
-- **On-chain** — the `Settlement` contract (one settlement path behind three doors — pull, push, and
-  a signature-based pull that spends no allowance — with a per-ref replay guard) moving money
-  through a `SafeTransfer` wrapper that accepts every answer a real token gives — a boolean,
-  nothing at all, a revert — a mock token zoo that reproduces real ERC-20 misbehaviour (no return
-  value, approve races, transfer fees, blacklists), a one-command local devnet, and mainnet-fork
-  tests that check the mocks — the wrapper and the Permit2 path included — against the real thing.
+- **On-chain** — the `Settlement` contract (three instant doors — pull, push, and a signature-based
+  pull that spends no allowance — plus an escrow that holds funds until they are released with a
+  fee split or refunded in full, all behind one per-ref replay guard) moving money through a
+  `SafeTransfer` wrapper that accepts every answer a real token gives — a boolean, nothing at all,
+  a revert — a mock token zoo that reproduces real ERC-20 misbehaviour (no return value, approve
+  races, transfer fees, blacklists), a one-command local devnet, and mainnet-fork tests that check
+  the mocks — the wrapper and the Permit2 path included — against the real thing.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
@@ -381,6 +382,26 @@ merchant, amount, spender, deadline, nonce — against `test/mocks/Permit2Mock.s
 `test/fork/SettlementPermit2Mainnet.t.sol` replays the same signature against the real Permit2 on a
 mainnet fork.
 
+### Escrow and the fee split
+
+Every door so far settles on the spot — by the time the transaction is mined the money has already
+left the payer and reached the merchant, and the engine that moved it has never charged anyone a
+cent. `hold()` opens the deferred path: it pulls the payer's funds into the contract, records
+`token / payer / merchant / amount / fee / feeRecipient / refundAfter` under the ref, and occupies
+the same per-ref replay guard as the instant doors — one ref enters once, whichever path it takes,
+and a refunded ref stays burned: retrying a payment means a new intent and a new ref. `release()`
+settles the escrow exactly as agreed at hold time — `amount - fee` to the merchant, `fee` to the
+`feeRecipient` — and `refund()` returns the full amount to the payer, fee included, because the fee
+exists only on a completed settlement. Both delete the record before paying out, the same
+discipline as reserve-before-transfer, so a reentrant token finds no hold left to double-spend.
+The fee rate is deliberately not the contract's business: `fee` and `feeRecipient` are call
+parameters, following Request Network's `transferFromWithReferenceAndFee`, and the policy that
+computes them lives off-chain. Two boundaries moved along with the money. The deposit is the one
+place the contract measures what actually arrived — a fee-on-transfer token would leave behind a
+hold the contract can never pay out, so a short deposit is rejected at the door. And `refundAfter`
+is the payer's backstop — once it passes, they reclaim their funds without asking anyone.
+`SettlementEscrow.t.sol` pins who can move money while it sits in the contract, and who never can.
+
 ## Repository layout
 
 <details>
@@ -465,7 +486,7 @@ contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
     ├── src/
-    │   ├── Settlement.sol        # One settlement path, three doors: pull, push, signature-based pull; per-ref replay guard
+    │   ├── Settlement.sol        # Three instant doors (pull, push, signature-based pull) plus a hold/release/refund escrow; per-ref replay guard
     │   ├── interfaces/
     │   │   ├── IERC20.sol        # Minimal EIP-20 interface, written from the spec
     │   │   └── ISignatureTransfer.sol # Permit2's signature-transfer half: permitWitnessTransferFrom and the nonce bitmap
@@ -485,6 +506,7 @@ contracts/
     └── test/
         ├── Settlement.t.sol      # The allowance doors, the replay guard (reentrant token included), the four classes passing through
         ├── SettlementPermit2.t.sol # The signature door: what the signature binds, and the shared replay guard
+        ├── SettlementEscrow.t.sol # The escrow path: hold in, release with a fee split or refund in full; who may pull money out
         ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
         ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
         ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
