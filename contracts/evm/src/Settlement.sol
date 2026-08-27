@@ -21,7 +21,7 @@ import {SafeTransfer} from "./libraries/SafeTransfer.sol";
 ///      CAS）擋的是鏈下的重複，這裡的 paid mapping 是整條 pipeline 最後一道防線：
 ///      不管哪個元件出了什麼 bug、簽了幾筆交易，同一個 ref 在這份合約上只有一筆走得完。
 ///
-///      搬錢的路徑有兩條。第一條當場結清，一筆交易裡錢從 payer 直達 merchant，三個入口：
+///      搬錢的路徑有兩條。第一條當場結清，一筆交易裡錢從 payer 直達 merchant，四個入口：
 ///      - settle()：pull 支付流。relayer 發起並代付 gas，動用 payer 事先給這份合約的
 ///        allowance。只有 relayer 名單上的地址能呼叫，不然任何人都能拿 payer 的
 ///        allowance 把錢搬給任意 merchant。
@@ -30,6 +30,9 @@ import {SafeTransfer} from "./libraries/SafeTransfer.sol";
 ///      - settleWithPermit()：一樣是 pull 支付流，但 payer 給的不是這份合約的 allowance，
 ///        而是一份離線簽名。授權從「額度」變成「這一筆付款」，代價是金流路徑上多一份
 ///        外部合約（Permit2）。
+///      - settleBatch()：settle() 的批次版。同一個 payer、同一顆 token，一筆交易對一批
+///        merchant 各結一筆付款；每一項帶自己的 ref、發自己的 Paid，「批次」只存在於
+///        交易這一層。
 ///      第二條先留後結，也就是託管：
 ///      - hold()：relayer 發起，把 payer 的錢先收進合約，記成一筆 Hold。
 ///      - release()：relayer 發起，替一筆託管拆帳：amount 減 fee 給 merchant，
@@ -39,7 +42,7 @@ import {SafeTransfer} from "./libraries/SafeTransfer.sol";
 ///      兩條路共用同一份 paid 標記：一個 ref 不管走哪條路，都只進得來一次。
 ///
 ///      刻意不做的事：
-///      - 當場結清的三個入口不持有錢。transferFrom 直接從 payer 到 merchant，走完之後
+///      - 當場結清的四個入口不持有錢。transferFrom 直接從 payer 到 merchant，走完之後
 ///        合約帳上一毛不多。合約持有的只有託管中的錢，而且每一塊都對得回一筆 hold 記錄；
 ///        錢離開合約只有 release 與 refund 兩條路，去向都被那筆記錄釘死，所以它仍然
 ///        沒有 pause 或任意提款這類管理資產的函式。
@@ -52,6 +55,14 @@ import {SafeTransfer} from "./libraries/SafeTransfer.sol";
 ///        feeAmount 轉給 feeAddress。
 ///      - 不自動退款。refundAfter 只是把「payer 自己拿回錢」的門打開，沒有任何元件會
 ///        主動呼叫 refund()；一筆託管該結該退、什麼時候動手，都是鏈下的判斷。
+///      - 批次不先集中再分發。公開前例 Disperse（https://github.com/banteg/disperse-research）
+///        兩種形狀都做了：disperseToken 先把總額收進合約再逐筆 transfer 出去，
+///        disperseTokenSimple 逐筆 transferFrom 直達收款人；這裡照後者，理由寫在
+///        settleBatch() 的註解裡。
+///      - 批次不逐筆容錯。中間任何一項失敗，整批回滾，沒有任何 ref 被占走；把壞的項目
+///        剔掉是上鏈之前鏈下驗證的工作，之後再討論。
+///      - 批次不設上限。真正的上限是區塊的 gas 上限，一批塞得下多少項，是鏈下組批時
+///        照當下的鏈況判斷的事，寫死在合約裡只會變成第二份判斷。
 ///      - allowance 那兩個入口不驗單筆授權。settle() 與 pay() 的信任模型是「payer 的
 ///        allowance 信任這份合約，合約信任 relayer 名單」，名單上的 relayer 在額度內
 ///        可以發起任何付款。要把授權收窄到單筆就走 settleWithPermit()：payer 簽的那份
@@ -177,6 +188,42 @@ contract Settlement {
     function settle(address token, address payer, address merchant, uint256 amount, bytes32 ref) external {
         require(isRelayer[msg.sender], "Settlement: caller is not a relayer");
         _settle(token, payer, merchant, amount, ref);
+    }
+
+    /// @notice 一筆撥款批次裡的一項：哪個 merchant、收多少錢、對到哪一個 ref。
+    /// @dev 一項就是一筆完整的付款：自己的 ref、自己的 Paid、鏈下自己的 intent。批次只是
+    ///      交易層的打包，付款的身分不因為同車而合併。token 與 payer 刻意不進這個 struct：
+    ///      一個批次只有一個 payer、一顆 token，塞進每一項只是讓呼叫端多一種寫錯的方式；
+    ///      要替第二個 payer 付錢，那是另一個批次。
+    struct Payout {
+        address merchant;
+        uint256 amount;
+        bytes32 ref;
+    }
+
+    /// @notice pull 支付流的批次版：同一個 payer、同一顆 token，一筆交易對一批 merchant
+    ///         各結一筆付款。
+    /// @dev 對鏈下來說「批次」不存在：每一項各走一次完整的 _settle（占自己的 ref、
+    ///      搬自己的錢、發自己的 Paid），listener 與對帳引擎看到的是 N 筆各自帶 ref 的
+    ///      付款，不需要知道它們來自同一筆交易。批次裡重複的 ref 也因此被同一道 replay 防護擋下。
+    ///
+    ///      錢逐筆從 payer 直達 merchant，不先集中進合約。Disperse 的 disperseToken 是
+    ///      先把總額收進合約、再逐筆 transfer 出去，比逐筆 transferFrom 少付 N-1 次
+    ///      allowance 的寫入；這裡照它的另一個形狀 disperseTokenSimple 逐筆直達，理由有二：
+    ///      合約帳上不多一毛，「合約持有的每一塊錢都對得回一筆 hold 記錄」的不變量原樣
+    ///      成立；fee-on-transfer 的短少也留在 payer 到 merchant 那一段，跟單筆 settle()
+    ///      同一種語義，合約不必為了批次開始量實收。
+    ///
+    ///      中間任何一項失敗（token revert、回傳 false、allowance 用完），整批回滾：
+    ///      沒有半筆錢動過、也沒有任何 ref 被占走，重試整批跟重試一筆一樣安全。
+    ///      逐筆容錯（跳過壞的、只結好的）刻意不做：部分成功的批次是最難收拾的狀態，
+    ///      哪幾筆成功要逐筆對 event 才知道；把壞的項目剔掉是上鏈之前鏈下驗證的工作。
+    function settleBatch(address token, address payer, Payout[] calldata items) external {
+        require(isRelayer[msg.sender], "Settlement: caller is not a relayer");
+        require(items.length > 0, "Settlement: the batch is empty");
+        for (uint256 i = 0; i < items.length; i++) {
+            _settle(token, payer, items[i].merchant, items[i].amount, items[i].ref);
+        }
     }
 
     /// @notice pull 支付流的簽名版：payer 沒有給這份合約任何 allowance，只給了一份離線簽名。
