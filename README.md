@@ -10,8 +10,9 @@ the engine cannot decide safely goes to a person instead of being guessed at.
 
 **What exists today**
 
-- **On-chain** — the `Settlement` contract (three instant doors — pull, push, and a signature-based
-  pull that spends no allowance — plus an escrow that holds funds until they are released with a
+- **On-chain** — the `Settlement` contract (four instant doors — pull, push, a signature-based
+  pull that spends no allowance, and a batch that settles a whole payout run in one transaction —
+  plus an escrow that holds funds until they are released with a
   fee split or refunded in full, all behind one per-ref replay guard) moving money through a
   `SafeTransfer` wrapper that accepts every answer a real token gives — a boolean, nothing at all,
   a revert — a mock token zoo that reproduces real ERC-20 misbehaviour (no return value, approve
@@ -402,6 +403,24 @@ hold the contract can never pay out, so a short deposit is rejected at the door.
 is the payer's backstop — once it passes, they reclaim their funds without asking anyone.
 `SettlementEscrow.t.sol` pins who can move money while it sits in the contract, and who never can.
 
+### Batch settlement
+
+A payout run pays hundreds of merchants at once, and so far every payment costs one transaction —
+one slot on the sending account's single nonce line, and 21,000 gas of base cost before a single
+token moves. `settleBatch()` packs a run into one transaction: same payer, same token, and a list of
+`(merchant, amount, ref)` items that each walk the full `_settle` path — own ref reserved, own
+`Paid` event — so the listener and the reconciliation engine see N ordinary payments and never learn
+the word batch. Every item moves money straight from payer to merchant, following Disperse's
+`disperseTokenSimple` rather than its pool-then-distribute `disperseToken`: the contract's balance
+stays at zero, and a fee-on-transfer shortfall lands where it always lands — in the off-chain
+ledger, not in the contract. The other public shape — publish a merkle root and let recipients
+claim, as Uniswap's merkle-distributor does — moves the per-recipient gas bill onto the recipients
+and parks the funds in the contract until they come for them; the right shape for an airdrop, the
+wrong one for a payout run. A batch is atomic: one bad item rolls back the whole run and burns no
+refs, so retrying a batch is as safe as retrying a single payment, and skipping bad rows is
+validation work that belongs off-chain, before anything is signed. `SettlementBatch.t.sol` pins all
+of it, a two-hundred-merchant run included.
+
 ## Repository layout
 
 <details>
@@ -486,7 +505,7 @@ contracts/
 └── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
     ├── foundry.toml
     ├── src/
-    │   ├── Settlement.sol        # Three instant doors (pull, push, signature-based pull) plus a hold/release/refund escrow; per-ref replay guard
+    │   ├── Settlement.sol        # Four instant doors (pull, push, signature-based pull, batch) plus a hold/release/refund escrow; per-ref replay guard
     │   ├── interfaces/
     │   │   ├── IERC20.sol        # Minimal EIP-20 interface, written from the spec
     │   │   └── ISignatureTransfer.sol # Permit2's signature-transfer half: permitWitnessTransferFrom and the nonce bitmap
@@ -507,6 +526,7 @@ contracts/
         ├── Settlement.t.sol      # The allowance doors, the replay guard (reentrant token included), the four classes passing through
         ├── SettlementPermit2.t.sol # The signature door: what the signature binds, and the shared replay guard
         ├── SettlementEscrow.t.sol # The escrow path: hold in, release with a fee split or refund in full; who may pull money out
+        ├── SettlementBatch.t.sol # The batch door: one transaction, many payments; atomic rollback, shared replay guard
         ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
         ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
         ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
