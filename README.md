@@ -24,7 +24,8 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   one nonce line per sending account, fee-bumped replacement for stuck transactions, a retry
   policy that ends in a dead-letter store an operator can redrive from, a chain listener that
   settles a payment only once its chain calls the transaction irreversible, and a reconciliation
-  engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref.
+  engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
+  and a batch planner that cuts a payout run into transactions the target chain will accept.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
@@ -171,6 +172,7 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `finality` | what "irreversible" means on each chain, as one verdict | `Example_twoRulers` |
 | `listener` | the `confirming` owner: settle, hand back or review once the chain has spoken | `Example_confirmThreeWays` |
 | `recon` | the audit over a finalized window: sweep the open intents, match transfers by ref, file findings | `Example_reconcileWindow` |
+| `bulk` | how many payments fit in one transaction on a given chain, and what to fund before sending | `Example_packAPayoutRun` |
 
 ## Design notes
 
@@ -421,6 +423,21 @@ refs, so retrying a batch is as safe as retrying a single payment, and skipping 
 validation work that belongs off-chain, before anything is signed. `SettlementBatch.t.sol` pins all
 of it, a two-hundred-merchant run included.
 
+### Splitting a payout run
+
+How many payments fit in one transaction is never the contract's call, and the answer stops being a
+question about gas the moment the run leaves EVM. `bulk` takes a run and one chain's `Limits` — a
+list of `Rule`s, each with a cap, a fixed cost per transaction and a marginal cost per payout — and
+cuts the run, in order, into batches that clear every rule. EVM has one rule (`gas`, against the 30M
+target block size); Solana has two that have nothing to do with each other: the 1,232-byte
+serialized transaction and the 64 accounts the runtime will load. A payout whose recipient has no
+token account yet costs extra on both and costs rent on top, so `Pack` tries payouts one at a time
+rather than dividing a cap by a constant, and reports the rent the sending account has to fund
+before the first batch goes out. The same 300-payment run is one EVM transaction and twenty-five
+Solana ones; `Example_packAPayoutRun` prints both. What `bulk` deliberately will not do is reorder
+the run: a payout file is something a person reads, and batch #7 item #3 has to point back at a line
+in it.
+
 ## Repository layout
 
 <details>
@@ -492,6 +509,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── recon.go              # Transfer, Source (read half of a chain adapter, by height range), Kind (the five findings), Finding / Match / Sweep, Report
     │   ├── engine.go             # Engine.Run: sweep, then reconcile cursor+1..finalized; the cursor moves only after a clean run
     │   └── *_test.go             # Run_* (sweep enqueue / parked / confirming, fill in the hash, swap the hash, the five findings, window, replay no-op, race), Example_reconcileWindow
+    ├── bulk/                     # Cut a payout run into batches: one chain's transaction limits, in order, plus what to fund first
+    │   ├── bulk.go               # Payout, Batch, Usage, Plan and their fixed print format; ErrEmptyRun / ErrItemTooLarge
+    │   ├── limits.go             # Rule (cap / base / item / extra / source), Limits, Defaults() for evm and solana, MaxItems
+    │   ├── pack.go               # Pack(): try one payout at a time, close the batch when any rule would break, ErrNoRules
+    │   └── *_test.go             # Pack_* (evm one batch, solana twenty-five, order kept, new accounts, rent, caps, errors), Defaults_*, Example_packAPayoutRun
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
