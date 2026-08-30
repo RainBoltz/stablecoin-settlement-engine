@@ -166,7 +166,7 @@ func identifier(s string) bool {
 }
 
 // minorUnits 只收正整數的字串。小數點一律不收：「100.00」要換算成最小單位得先知道這顆 token
-// 有幾位小數，而那件事寫在 Terms 上、不在這一行裡，猜錯就是差一百倍。
+// 有幾位小數，而那是 token 的屬性，不是這一行講得出來的事。USDC 是 6 位，猜成 2 位就差一萬倍。
 func minorUnits(s string) (*big.Int, bool) {
 	if s == "" || len(s) > 40 {
 		return nil, false
