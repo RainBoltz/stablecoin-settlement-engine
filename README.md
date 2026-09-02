@@ -26,12 +26,15 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   settles a payment only once its chain calls the transaction irreversible, and a reconciliation
   engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
   plus a payout-file reader and a batch planner that turn a CSV run into the transactions the target
-  chain will accept, and translate a failed batch back into the file lines it came from.
+  chain will accept, and translate a failed batch back into the file lines it came from — every
+  per-chain rule they consult now answered by one adapter per protocol, behind a registry that
+  refuses a chain wired halfway.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
-The sender, the watcher and the recon source are still fakes; the real chain adapters and the
-non-EVM chains land in their own directories as the series progresses.
+The sender, the watcher and the recon source are still fakes; `chain` now pins what an adapter
+must answer before it may exist, and the RPC-backed implementations land behind it as the series
+progresses.
 
 ## Quick start
 
@@ -175,6 +178,7 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `recon` | the audit over a finalized window: sweep the open intents, match transfers by ref, file findings | `Example_reconcileWindow` |
 | `bulk` | how many payments fit in one transaction on a given chain, and what to fund before sending | `Example_packAPayoutRun` |
 | `intake` | a CSV payout file to a run: which rows go out, which are rejected and why, and which line each one came from | `Example_readAPayoutFile` |
+| `chain` | one adapter per protocol: the questions every chain must answer, and a registry that refuses half answers | `Example_askTheRegistry` |
 
 ## Design notes
 
@@ -457,6 +461,24 @@ once as `Terms`, so no row can name a different token, and amounts are whole min
 converting `100.00` needs decimals the row does not carry. `Example_readAPayoutFile` reads a
 300-row file with four broken rows and follows it to a batch.
 
+### The chain adapter
+
+Four packages had already met the four chains one question at a time: `txseq` knows who computes
+their own slot number, `txfee` knows who can outbid a stuck transaction, `finality` knows what each
+chain calls irreversible, `bulk` knows what fits in one transaction. Nothing guaranteed those
+answers agreed on which chains exist — `finality.Defaults()` knows four, `bulk.Defaults()` knows
+two, and the disagreement only surfaced when a payment reached the code that asked (`ErrNoPolicy`,
+`ErrNoRules`). `chain` closes that gap without moving a single rule: an `Adapter` is one protocol's
+single representative, answering the questions every chain must answer — its name, `Sequencer`,
+`Finality`, `BatchLimits` — by pointing at the packages that own the rules. Replacement is
+deliberately not one of them: a chain that cannot replace has no honest answer to give, so
+`Replacer` is an optional capability behind a type assertion, the same move `OrderedSender` and
+`ReplacingSender` already make, and `Replacement(a)` returns `false` rather than a zero policy. The
+`Registry` maps `evm:31337` to the `evm` adapter — protocol before the colon, networks share one
+adapter — and `Register` refuses an adapter that skips a question, moving the missing-chain error
+from the middle of the night to the moment of wiring. `Example_askTheRegistry`
+(`internal/chain/example_test.go`) interviews both chains and shows `ton` being turned away.
+
 ## Repository layout
 
 <details>
@@ -538,6 +560,12 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── read.go               # Read(): header, then row by row; whole-file failures vs row failures vs the Policy
     │   ├── trace.go              # Run.Trace(): a batch index back to file lines, refusing a plan that was packed elsewhere
     │   └── *_test.go             # Read_* (default reject, skip, ceiling, every bad row, amounts, duplicates, header, BOM, refs, lines), Trace_*, Example_readAPayoutFile
+    ├── chain/                    # One adapter per protocol: the questions every chain must answer, behind a registry that refuses half answers
+    │   ├── chain.go              # Adapter (protocol, sequencer, finality, batch limits), the Replacer capability, Replacement()
+    │   ├── registry.go           # Registry: Register vets every answer, For("evm:31337") -> the evm adapter, Default()
+    │   ├── evm.go                # The evm adapter: a real Counter, the txfee replacement policy, the existing defaults
+    │   ├── solana.go             # The solana adapter: Unordered slots, and no Replacer on purpose
+    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / Replacement_* / Adapters_*, Example_askTheRegistry
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
