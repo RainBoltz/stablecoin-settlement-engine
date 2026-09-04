@@ -17,14 +17,18 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   `SafeTransfer` wrapper that accepts every answer a real token gives — a boolean, nothing at all,
   a revert — a mock token zoo that reproduces real ERC-20 misbehaviour (no return value, approve
   races, transfer fees, blacklists), a one-command local devnet, and mainnet-fork tests that check
-  the mocks — the wrapper and the Permit2 path included — against the real thing.
+  the mocks — the wrapper and the Permit2 path included — against the real thing. On Solana, the
+  `payout-run` program locks a whole payout run behind one signature: fund the vault and pin the
+  run's merkle root once, let a relayer pay verified blocks of eight, claw back what is left after
+  the deadline — accounts closed, rent recovered.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
   one nonce line per sending account, fee-bumped replacement for stuck transactions, a retry
   policy that ends in a dead-letter store an operator can redrive from, a chain listener that
   settles a payment only once its chain calls the transaction irreversible, and a reconciliation
-  engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref.
+  engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
+  plus a batch planner that cuts a payout run into the transactions each target chain will accept.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
@@ -171,6 +175,8 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `finality` | what "irreversible" means on each chain, as one verdict | `Example_twoRulers` |
 | `listener` | the `confirming` owner: settle, hand back or review once the chain has spoken | `Example_confirmThreeWays` |
 | `recon` | the audit over a finalized window: sweep the open intents, match transfers by ref, file findings | `Example_reconcileWindow` |
+| `merkle` | one root for a whole payout run, one shared proof per aligned block | `TestBuild_GoldenRootAcrossImplementations` |
+| `bulk` | how many payments fit in one transaction on a given chain, and what to fund and prepare first | `Example_packAPayoutRun` |
 
 ## Design notes
 
@@ -421,6 +427,25 @@ refs, so retrying a batch is as safe as retrying a single payment, and skipping 
 validation work that belongs off-chain, before anything is signed. `SettlementBatch.t.sol` pins all
 of it, a two-hundred-merchant run included.
 
+### The payout run
+
+How many payments fit in one transaction was never the contract's call, and on Solana the question
+stops being about gas entirely: a transaction is capped at 1,232 serialized bytes, so a 300-line
+run travels as dozens of transactions — none of which the payer should have to pre-sign, because a
+signed transaction dies with its recent blockhash. The `payout-run` program
+(`contracts/solana/payout-run/`) lets the payer sign exactly once: `init_run` escrows the whole
+total into a program-owned vault and pins the merkle root of the run, `pay_batch` pays one aligned
+block of at most eight leaves after re-deriving that root from the accounts and amounts actually
+presented — so a relayer cranks every batch with a fresh blockhash yet cannot move a single lamport
+outside the signed list — and `clawback` returns whatever is unpaid to the payer once the deadline
+passes, closing both accounts and recovering their rent. Off-chain, `merkle` builds the tree
+(SHA-256, one domain byte per node kind, zero-padded to a power of two) and hands out one shared
+proof per block, while `bulk` cuts the run to match: aligned batches of eight for Solana, the
+greedy gas-bound batch for EVM, plus the prepare batches that create missing token accounts before
+any money moves. The run's ceiling is the tree's own doing — past 16,384 leaves a full block plus
+its proof no longer fits a transaction. `Example_packAPayoutRun` walks the same 300-payout run
+through both chains; the program's tests replay the golden root the Go side pins.
+
 ## Repository layout
 
 <details>
@@ -445,6 +470,9 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
     │   ├── testdata/transitions.golden
     │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, ref_test.go, Example_lifecycle
+    ├── merkle/                   # One root for a payout run: SHA-256, domain bytes, zero padding, one shared proof per aligned block
+    │   ├── merkle.go             # Leaf / PadLeaf / Build / Tree (Root, Depth, BlockProof), VerifyBlock; ErrEmptyTree
+    │   └── merkle_test.go        # Build_* (padding, golden root pinned across languages), BlockProof_*, VerifyBlock_* (tamper, wrong block, reorder)
     ├── ledger/                   # Double-entry ledger: append-only, hash-chained journal of hold / post / void entries, keyed by PaymentRef
     │   ├── ledger.go             # Asset, Account (payer: / merchant: / fee:), Leg, Kind, Entry, Validate (legs sum to zero)
     │   ├── hash.go               # Preimage + sha256 chain: every entry hashes the previous one
@@ -492,6 +520,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── recon.go              # Transfer, Source (read half of a chain adapter, by height range), Kind (the five findings), Finding / Match / Sweep, Report
     │   ├── engine.go             # Engine.Run: sweep, then reconcile cursor+1..finalized; the cursor moves only after a clean run
     │   └── *_test.go             # Run_* (sweep enqueue / parked / confirming, fill in the hash, swap the hash, the five findings, window, replay no-op, race), Example_reconcileWindow
+    ├── bulk/                     # Cut a payout run into batches: aligned blocks for chains with a root, greedy for gas, prepare work first
+    │   ├── bulk.go               # Payout, Batch (Prep included), Usage, Plan and their fixed print format; ErrEmptyRun / ErrItemTooLarge / ErrBlockTooLarge
+    │   ├── limits.go             # Rule (cap / base / item / per-level / source), Limits (Align, PrepareRules), Defaults(), MaxItems
+    │   ├── pack.go               # Pack(): greedy for Align 0, aligned blocks otherwise, prepare batches for missing accounts; ErrNoRules
+    │   └── *_test.go             # Pack_* (evm one batch, solana aligned 38, order kept, prepare, rent, caps, ceiling, errors), Defaults_*, Example_packAPayoutRun
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -502,40 +535,47 @@ backend/                          # Go module (stdlib only so far), go 1.24
         ├── api.go                # routes, request/response shapes, NewIntentID, TraceResponse
         └── *_test.go             # CreateIntent_*, GetIntent_*, TraceRef_*, Example_retryStorm, Example_traceByRef
 contracts/
-└── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
-    ├── foundry.toml
-    ├── src/
-    │   ├── Settlement.sol        # Four instant doors (pull, push, signature-based pull, batch) plus a hold/release/refund escrow; per-ref replay guard
-    │   ├── interfaces/
-    │   │   ├── IERC20.sol        # Minimal EIP-20 interface, written from the spec
-    │   │   └── ISignatureTransfer.sol # Permit2's signature-transfer half: permitWitnessTransferFrom and the nonce bitmap
-    │   ├── libraries/
-    │   │   └── SafeTransfer.sol  # Transfer via low-level call: revert forwarded, false caught, empty returndata needs code
-    │   └── mocks/                # Mock token zoo: real-world ERC-20 misbehaviour
-    │       ├── ERC20Mock.sol             # Fully compliant baseline
-    │       ├── USDTMock.sol              # No return value, approve race lock, fee, blacklist, pause
-    │       ├── NoRevertERC20Mock.sol     # Returns false instead of reverting
-    │       └── FeeOnTransferERC20Mock.sol# Recipient always receives less than was sent
-    ├── script/
-    │   ├── DevnetAccounts.sol    # The cast: deployer / payer / merchant / relayer / blacklisted
-    │   ├── TokenZooBase.sol      # deploy() + seed() + deployments json, no run(); tests inherit it
-    │   ├── DeployTokenZoo.s.sol  # run(): broadcast the deployment, write deployments/<chainId>.json
-    │   └── SeedDevnet.s.sol      # run(): read the json, broadcast the world state
-    ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
-    └── test/
-        ├── Settlement.t.sol      # The allowance doors, the replay guard (reentrant token included), the four classes passing through
-        ├── SettlementPermit2.t.sol # The signature door: what the signature binds, and the shared replay guard
-        ├── SettlementEscrow.t.sol # The escrow path: hold in, release with a fee split or refund in full; who may pull money out
-        ├── SettlementBatch.t.sol # The batch door: one transaction, many payments; atomic rollback, shared replay guard
-        ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
-        ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
-        ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
-        ├── mocks/
-        │   └── Permit2Mock.sol   # Offline stand-in for Permit2: same EIP-712 digest, same nonce bitmap, same error order
-        └── fork/
-            ├── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
-            ├── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
-            └── SettlementPermit2Mainnet.t.sol # The same signature against the real Permit2 (needs ETH_RPC_URL)
+├── evm/                          # Foundry project, Solidity 0.8.26, forge-std only
+│   ├── foundry.toml
+│   ├── src/
+│   │   ├── Settlement.sol        # Four instant doors (pull, push, signature-based pull, batch) plus a hold/release/refund escrow; per-ref replay guard
+│   │   ├── interfaces/
+│   │   │   ├── IERC20.sol        # Minimal EIP-20 interface, written from the spec
+│   │   │   └── ISignatureTransfer.sol # Permit2's signature-transfer half: permitWitnessTransferFrom and the nonce bitmap
+│   │   ├── libraries/
+│   │   │   └── SafeTransfer.sol  # Transfer via low-level call: revert forwarded, false caught, empty returndata needs code
+│   │   └── mocks/                # Mock token zoo: real-world ERC-20 misbehaviour
+│   │       ├── ERC20Mock.sol             # Fully compliant baseline
+│   │       ├── USDTMock.sol              # No return value, approve race lock, fee, blacklist, pause
+│   │       ├── NoRevertERC20Mock.sol     # Returns false instead of reverting
+│   │       └── FeeOnTransferERC20Mock.sol# Recipient always receives less than was sent
+│   ├── script/
+│   │   ├── DevnetAccounts.sol    # The cast: deployer / payer / merchant / relayer / blacklisted
+│   │   ├── TokenZooBase.sol      # deploy() + seed() + deployments json, no run(); tests inherit it
+│   │   ├── DeployTokenZoo.s.sol  # run(): broadcast the deployment, write deployments/<chainId>.json
+│   │   └── SeedDevnet.s.sol      # run(): read the json, broadcast the world state
+│   ├── deployments/              # Generated, git-ignored. Off-chain code reads addresses from here
+│   └── test/
+│       ├── Settlement.t.sol      # The allowance doors, the replay guard (reentrant token included), the four classes passing through
+│       ├── SettlementPermit2.t.sol # The signature door: what the signature binds, and the shared replay guard
+│       ├── SettlementEscrow.t.sol # The escrow path: hold in, release with a fee split or refund in full; who may pull money out
+│       ├── SettlementBatch.t.sol # The batch door: one transaction, many payments; atomic rollback, shared replay guard
+│       ├── SafeTransfer.t.sol    # The three answer shapes plus the no-code guard, behind a caller harness
+│       ├── TokenZoo.t.sol        # One test per trap, plus a conservation fuzz test
+│       ├── Devnet.t.sol          # Inherits TokenZooBase and asserts the seeded world state
+│       ├── mocks/
+│       │   └── Permit2Mock.sol   # Offline stand-in for Permit2: same EIP-712 digest, same nonce bitmap, same error order
+│       └── fork/
+│           ├── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
+│           ├── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
+│           └── SettlementPermit2Mainnet.t.sol # The same signature against the real Permit2 (needs ETH_RPC_URL)
+└── solana/
+    └── payout-run/               # Native Solana program (solana-program only): one signature per payout run
+        ├── Cargo.toml            # solana-program pinned to the 2.2 line; test deps: solana-program-test, spl-token
+        ├── src/
+        │   └── lib.rs            # init_run (escrow the total, pin the root), pay_batch (verify an aligned block, pay it), clawback
+        └── tests/
+            └── payout_run.rs     # BanksClient tests: the golden root, tamper / swap / partial-block rejections, the clawback line
 ```
 
 </details>
