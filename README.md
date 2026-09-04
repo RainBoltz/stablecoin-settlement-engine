@@ -33,13 +33,16 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   per-chain rule they consult now answered by one adapter per protocol (EVM, Solana and TON) that
   also builds its chain's unsigned bytes — a calldata, a payout-run message, or a W5 wallet request
   that carries up to 255 jetton transfers behind one signature — behind a registry that refuses a
-  chain wired halfway.
+  chain wired halfway; on TON the adapter also reads: it follows every payment hop by hop to the
+  merchant's jetton wallet before the listener may call it settled, and it reconciles at that same
+  hop so a payment counts once.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
-The sender, the watcher and the recon source are still fakes; `chain` now pins what an adapter
-must answer before it may exist, and the RPC-backed implementations land behind it as the series
-progresses.
+The sender is still a fake on every chain, and so are the watcher and the recon source on EVM and
+Solana; `chain` pins what an adapter must answer before it may exist, TON's `TONReader` is the first
+read half that follows a payment through the chain's own transactions (against an in-memory node for
+now), and the RPC-backed implementations land behind it as the series progresses.
 
 ## Quick start
 
@@ -73,6 +76,7 @@ cd backend && go test ./internal/... -run Example -v
 | `make evm-build` | compile `contracts/evm` |
 | `make evm-test` | the Solidity suite; the mainnet-fork tests are skipped |
 | `make evm-test-fork` | the mainnet-fork faithfulness tests; needs `ETH_RPC_URL` |
+| `make ton-test` | the Go-built W5 request against the real W5 wallet and real jetton contracts in `@ton/sandbox`; needs node (the first run does `npm ci`) |
 | `make go-test` | `go vet` + `go test` for `backend/` |
 | `make api-run` | the Payment API on `http://127.0.0.1:8080`, memory stores, no chain |
 | `make devnet` | start anvil, deploy the Token Zoo, seed balances; state persists in `.devnet/` |
@@ -184,7 +188,7 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `merkle` | one root for a whole payout run, one shared proof per aligned block | `TestBuild_GoldenRootAcrossImplementations` |
 | `bulk` | how many payments fit in one transaction on a given chain, and what to fund and prepare first | `Example_packAPayoutRun` |
 | `intake` | a CSV payout file to a run: which rows go out, which are rejected and why, and which line each one came from | `Example_readAPayoutFile` |
-| `chain` | one adapter per protocol: the questions every chain must answer, a registry that refuses half answers, and each chain's unsigned bytes | `Example_askTheRegistry`, `Example_buildTheSameRunTwice`, `Example_buildATONRequest` |
+| `chain` | one adapter per protocol: the questions every chain must answer, a registry that refuses half answers, each chain's unsigned bytes, and TON's read half | `Example_askTheRegistry`, `Example_buildTheSameRunTwice`, `Example_buildATONRequest`, `Example_readATONPayout` |
 | `boc` | TON's unit of data: a cell builder and reader, the standard cell hash, and bag-of-cells bytes, pinned against `@ton/core` | `TestCell_GoldenTreeWithSharedRefAndOddBits` |
 
 ## Design notes
@@ -538,12 +542,57 @@ our own op and the ref's first eight bytes as the `query_id`, wrapped in a bounc
 carrying 0.05 TON of gas money, threaded onto a W5 `OutList`, under a signing cell whose hash is the
 only thing the relayer signs. The cells come from `boc`, a stdlib-only cell builder whose hashes and
 bytes are pinned against `@ton/core`; the request itself is pinned against `@ton/ton`'s
-`createWalletTransferV5R1` at 1, 12 and 255 payouts. What the request does not promise is atomicity:
+`createWalletTransferV5R1` at 1, 12 and 255 payouts. A pinned hash only proves two encoders agree, so
+`make ton-test` (`contracts/ton/`) goes one step further: it signs the same bytes and hands them to the
+real W5 code and to two real jetton contracts compiled from their vendored sources, the TEP-74 reference
+and the `stablecoin-contract` behind USDT, inside `@ton/sandbox`. Three payouts land on both jettons,
+255 land behind one signature (the wallet spends 187k of its 1M gas), a `transfer` our own jetton wallet
+refuses bounces back to the wallet, and an `internal_transfer` into a USDT wallet the admin has locked
+bounces back to `on_bounce`. The OutList wraps the first payout innermost, so the wallet emits the
+payouts in list order (this is where `@ton/ton` 15.x, which wrapped them the other way round, and 16.x
+part). The 0.05 TON attached is ample: the chain keeps about 0.027 TON per payout with the reference
+wallet and 0.003 with USDT's, the rest comes back as `excesses`. And the 1-nanoton
+`transfer_notification` is emitted but never executed: it lands on the merchant as a transaction
+skipped for lack of gas, which is fine for a ledger that anchors on the jetton wallet, and not enough
+for a merchant contract that wants to act on it. What the request does not promise is atomicity:
 a batch here is transport, not a unit of failure — every message goes its own way once the wallet
 has emitted it, and a merchant whose jetton wallet rejects the transfer bounces that one payment back
 while the other 254 land. Whether a payment landed is read from the last hop, not the first, and
 that is the reader's job, not the builder's. `Example_buildATONRequest` builds the 12-payout list as
 one request and cuts a 300-payout run into two.
+
+### Reading a TON payment
+
+The request above is what the relayer holds after sending: not a transaction hash but the hash of
+one external message, and the wallet transaction that message produces says nothing about money. It
+says the seqno was spent and N messages left. `TONReader` is the adapter's read half for a chain
+where "did the transaction succeed" has no single answer: it implements `listener.Watcher` and
+`recon.Source` by following a payment through the chain's own transactions instead of looking one
+up. `Trace` starts at the wallet transaction that consumed the external message, picks the
+`transfer` carrying this intent's ref, finds the transaction that consumed it on our jetton wallet,
+then the `internal_transfer` it emitted and the transaction that consumed that on the merchant's
+jetton wallet — the only transaction that credits a balance, and therefore the terminal one. Each
+hop may not have happened yet (`in flight`), or may have failed: a failing hop returns a bounced
+message, and the transaction where that bounce lands — the wallet for a `transfer` our own jetton
+wallet refused (`rejected`), our jetton wallet's `on_bounce` that restores the balance for an
+`internal_transfer` the merchant's wallet refused (`bounced`) — is the terminal one for a failure.
+The trace is translated into the `Observation` the listener already understands, with three shifted
+meanings. `Included` means the wallet accepted the request, and an accepted request never goes
+`lost`: messages are delayed on TON, not dropped, so only a request the wallet never took can expire
+into `settling` again. `Height` and `Final` come from the terminal hop's masterchain reference, not
+the wallet's — the wallet is irreversible at 101 while the money lands at 103 — and `Succeeded`
+means the terminal hop is the credit, so a bounce judges as `failed` and lands in `needs_review`
+like an EVM revert. The recon side scans the watched merchants' jetton wallets and reports only
+successful, non-bounced `internal_transfer` transactions, reading the ref from the `forward_payload`:
+the same ref rides three messages on one trace and a bounced payment leaves a perfectly real
+`internal_transfer` on our side, so anchoring anywhere but the receiver counts a payment three times
+or counts a refund as a payment. `Example_readATONPayout` sends three payouts in one request and
+watches one land, one bounce and one stay on the road, then reconciles the window.
+The in-memory TON those tests run against was written from reading `jetton-wallet.fc`, by the same hands
+as the reader, so `make ton-test` also records every transaction of its sandbox scenarios into
+`testdata/tonsandbox/` and the reader is run over those: each message body is rebuilt bit by bit through
+`boc` and must hash to what `@ton/core` computed, and the delivered, refused and bounced traces, the
+observations and the reconciliation have to come out the same on the real contracts' output as on the fake.
 
 ## Repository layout
 
@@ -556,7 +605,8 @@ scripts/
 └── devnet.sh                     # Local devnet lifecycle: up / down / reset / seed / status
 backend/                          # Go module (stdlib only so far), go 1.24
 ├── cmd/
-│   └── api/                      # `make api-run`: the Payment API on memory stores, for curl
+│   ├── api/                      # `make api-run`: the Payment API on memory stores, for curl
+│   └── tondump/                  # The Go end of `make ton-test`: build a W5 request from a JSON list, print the signing cell and every message
 └── internal/
     ├── paymentref/               # PaymentRef: sha256 commitment over (intent id + payment terms), 32 bytes, goes on-chain
     │   ├── ref.go                # Terms, Derive, Preimage (length-prefixed), Ref.String / Parse (0x + 64 hex)
@@ -643,11 +693,16 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── solanamsg.go          # A payout run off-chain: leaves and tree (NewRun, the Root the payer signs), then one pay_batch message per aligned block
     │   ├── ton.go                # The ton adapter: a real Counter for the seqno, no Replacer (resend the same bytes), the existing defaults
     │   ├── tonmsg.go             # A W5 wallet request: one TEP-74 transfer per payout (ref in forward_payload), an OutList of up to 255, the signing cell; TONHops
+    │   ├── tonread.go            # TON's read half: TONMessage / TONTransaction / TONNode, Trace (hop by hop to the terminal transaction), TONReader as Watcher and Source
+    │   ├── testdata/tonsandbox/  # Recorded by `make ton-test`: every transaction of the sandbox scenarios against the real W5 and jetton contracts
     │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / TON_* / Replacement_* / Adapters_*,
     │                             # SettleBatchCalldata_* (cast golden, pinned selector, refusals), NewRun_* (cross-language golden root, refusals),
     │                             # PayBatchMessage_* (the bytes rule per batch, the pinned 300-run, the proof reaching the root, blockhash, dedup),
     │                             # TransferRequest_* (signing hash pinned against @ton/ton at 1 / 12 / 255, TEP-74 read-back, every ref aboard, the three rules, the 255 cut, refusals),
-    │                             # TONPayloadOp_*, TONHops_*, Build_*, Example_askTheRegistry, Example_buildTheSameRunTwice, Example_buildATONRequest
+    │                             # TONPayloadOp_*, TONHops_*, TONReader_* (delivered, in flight, bounced, rejected, not accepted, height of the last hop, once at the receiver,
+    │                             # a stranger's payment, not ours, through the listener; against an in-memory TON that plays the reference jetton wallet),
+    │                             # TONSandbox_* (the same reader over the recordings of the real contracts: delivered at 3 and 255, refused by ours, bounced by a locked USDT wallet),
+    │                             # Build_*, Example_askTheRegistry, Example_buildTheSameRunTwice, Example_buildATONRequest, Example_readATONPayout
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
@@ -692,13 +747,22 @@ contracts/
 │           ├── USDTMainnet.t.sol # Same assertions against the real USDT on a mainnet fork (needs ETH_RPC_URL)
 │           ├── SafeTransferMainnet.t.sol # The wrapper against the real USDT (needs ETH_RPC_URL)
 │           └── SettlementPermit2Mainnet.t.sol # The same signature against the real Permit2 (needs ETH_RPC_URL)
-└── solana/
-    └── payout-run/               # Native Solana program (solana-program only): one signature per payout run
-        ├── Cargo.toml            # solana-program pinned to the 2.2 line; test deps: solana-program-test, spl-token
-        ├── src/
-        │   └── lib.rs            # init_run (escrow the total, pin the root), pay_batch (verify an aligned block, pay it), clawback
-        └── tests/
-            └── payout_run.rs     # BanksClient tests: the golden root, tamper / swap / partial-block rejections, the clawback line
+├── solana/
+│   └── payout-run/               # Native Solana program (solana-program only): one signature per payout run
+│       ├── Cargo.toml            # solana-program pinned to the 2.2 line; test deps: solana-program-test, spl-token
+│       ├── src/
+│       │   └── lib.rs            # init_run (escrow the total, pin the root), pay_batch (verify an aligned block, pay it), clawback
+│       └── tests/
+│           └── payout_run.rs     # BanksClient tests: the golden root, tamper / swap / partial-block rejections, the clawback line
+└── ton/                          # `make ton-test`: the Go-built W5 request against the real W5 wallet and real jetton contracts in @ton/sandbox
+    ├── package.json              # @ton/core, @ton/ton (the W5 code and the reference encoder), @ton/sandbox, func-js; every version pinned
+    ├── contracts/                # Vendored FunC sources, unmodified; UPSTREAM.md names the repositories and commits
+    │   ├── ft/                   # The TEP-74 reference jetton (ton-blockchain/token-contract)
+    │   └── usdt/                 # The jetton behind USDT on TON (ton-blockchain/stablecoin-contract)
+    ├── compile.mjs               # func-js: the four contracts into build/, code hashes printed
+    ├── lib.mjs                   # The bridge to backend/cmd/tondump
+    ├── golden.mjs                # The three pinned requests rebuilt with @ton/ton and compared byte for byte
+    └── e2e.mjs                   # Six scenarios: delivered at 3 (both jettons) and 255, refused (both), a locked USDT wallet; records testdata/tonsandbox/
 ```
 
 </details>
