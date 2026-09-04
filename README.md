@@ -28,7 +28,8 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   policy that ends in a dead-letter store an operator can redrive from, a chain listener that
   settles a payment only once its chain calls the transaction irreversible, and a reconciliation
   engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
-  plus a batch planner that cuts a payout run into the transactions each target chain will accept.
+  plus a payout-file reader and a batch planner that turn a CSV run into the transactions the target
+  chain will accept, and translate a failed batch back into the file lines it came from.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
@@ -177,6 +178,7 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `recon` | the audit over a finalized window: sweep the open intents, match transfers by ref, file findings | `Example_reconcileWindow` |
 | `merkle` | one root for a whole payout run, one shared proof per aligned block | `TestBuild_GoldenRootAcrossImplementations` |
 | `bulk` | how many payments fit in one transaction on a given chain, and what to fund and prepare first | `Example_packAPayoutRun` |
+| `intake` | a CSV payout file to a run: which rows go out, which are rejected and why, and which line each one came from | `Example_readAPayoutFile` |
 
 ## Design notes
 
@@ -446,6 +448,25 @@ any money moves. The run's ceiling is the tree's own doing — past 16,384 leave
 its proof no longer fits a transaction. `Example_packAPayoutRun` walks the same 300-payout run
 through both chains; the program's tests replay the golden root the Go side pins.
 
+### Reading a payout file
+
+A batch is atomic, so one unusable row does not cost one payment — it costs everybody sharing that
+transaction. `intake` reads the CSV before anything is signed and splits it in two: payouts that can
+go out, and `Reject`s that name a line, a reason and the value that caused it. The three failure
+levels are deliberately not symmetric. A wrong header or an empty file is fatal for the whole file,
+because every column after that is a guess. A bad row is only that row's problem, and what happens
+to the rest is a `Policy` the caller sets: rejecting the file is the default, since a payout file is
+usually machine-generated and one bad row more often means the generator broke than that one
+merchant is unusual; `Skip` with a `MaxRejects` ceiling is the deliberate override. A batch that
+reverts on chain is neither, and `Run.Trace` is the answer to it: a reverted batch becomes the file lines it
+was cut from, gaps and all, because the rejected rows are missing from the middle. Only three
+columns are in the file — `intent_id`, `merchant`, `amount` — with chain, token and payer supplied
+once as `Terms`, so no row can name a different token, and amounts are whole minor units only, since
+converting `100.00` needs decimals the row does not carry. Under the payout-run design the accepted
+list is also exactly what the payer signs: row order is leaf order, so the freeze happens here,
+before `init_run`. `Example_readAPayoutFile` reads a 300-row file with four broken rows and follows
+it to a batch.
+
 ## Repository layout
 
 <details>
@@ -525,6 +546,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── limits.go             # Rule (cap / base / item / per-level / source), Limits (Align, PrepareRules), Defaults(), MaxItems
     │   ├── pack.go               # Pack(): greedy for Align 0, aligned blocks otherwise, prepare batches for missing accounts; ErrNoRules
     │   └── *_test.go             # Pack_* (evm one batch, solana aligned 38, order kept, prepare, rent, caps, ceiling, errors), Defaults_*, Example_packAPayoutRun
+    ├── intake/                   # A CSV payout file to a run: accepted rows, rejected rows with a reason, and the line each came from
+    │   ├── intake.go             # Terms, Reason, Reject, Policy, Run, Trace and their fixed print format; the five errors
+    │   ├── read.go               # Read(): header, then row by row; whole-file failures vs row failures vs the Policy
+    │   ├── trace.go              # Run.Trace(): a batch index back to file lines, refusing a plan that was packed elsewhere
+    │   └── *_test.go             # Read_* (default reject, skip, ceiling, every bad row, amounts, duplicates, header, BOM, refs, lines), Trace_*, Example_readAPayoutFile
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
