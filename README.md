@@ -30,8 +30,8 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
   plus a payout-file reader and a batch planner that turn a CSV run into the transactions the target
   chain will accept, and translate a failed batch back into the file lines it came from — every
-  per-chain rule they consult now answered by one adapter per protocol, behind a registry that
-  refuses a chain wired halfway.
+  per-chain rule they consult now answered by one adapter per protocol that also builds its chain's
+  unsigned transaction bytes, behind a registry that refuses a chain wired halfway.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
@@ -489,6 +489,33 @@ adapter — and `Register` refuses an adapter that skips a question, moving the 
 from the middle of the night to the moment of wiring. `Example_askTheRegistry`
 (`internal/chain/example_test.go`) interviews both chains and shows `ton` being turned away.
 
+### Building the unsigned bytes
+
+The adapter's four answers fit one interface because they are all shaped alike — a name and a
+rulebook. Turning payouts into transactions is not: the two builders do not even agree on how much
+they build at a time, so there deliberately is no `Build` interface. `SettleBatchCalldata`
+ABI-encodes one batch for the settlement contract and is pinned byte-for-byte against Foundry's
+`cast calldata`; the selector is a constant, since computing it would need the keccak256 the stdlib
+does not have. The Solana side builds a whole run before it builds any transaction: `NewRun` hashes
+every payout into a leaf — index, token account, amount, ref, the exact bytes the on-chain program
+recomputes, pinned by a golden root the Rust tests pin too — and grows the tree whose `Root` is the
+one thing the payer signs. `PayBatchMessage` then serializes one aligned block per transaction —
+header, deduplicated account list, blockhash, one instruction ending in the block's shared proof —
+and its size is checked against what `bulk` recorded for that very batch: 280 + 73 per payout + 32
+per proof level, measured now rather than estimated, except one byte under it while the compact-u16
+data length still fits a single byte (the estimate may only ever be high). What the two outputs
+share is exactly one thing: every ref appears once in each, byte for byte, which is what lets the
+listener match either chain's transaction back to the same intents. Delivery data splits them — the
+EVM calldata carries none (nonce and fee live in the envelope, which is why a stuck transaction can
+be re-wrapped and replaced), while a Solana message signs its own recent blockhash. The same fact
+that condemned payer pre-signing is harmless here: the relayer signs these messages, and an expired
+one is rebuilt around a fresh blockhash while the signed root does not move a byte. Amounts split
+them too: uint256 on one side, the SPL u64 on the other, and an amount that does not fit is
+refused, never truncated. The prepare leg — creating the token accounts before the run pays them —
+is not built yet, so `bulk`'s 262 + 74 stay estimates. Signing stays behind the adapter on both
+chains: keccak256 and secp256k1 live outside the stdlib, and outside this repo.
+`Example_buildTheSameRunTwice` builds one 12-payout list for both chains.
+
 ## Repository layout
 
 <details>
@@ -578,7 +605,13 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── registry.go           # Registry: Register vets every answer, For("evm:31337") -> the evm adapter, Default()
     │   ├── evm.go                # The evm adapter: a real Counter, the txfee replacement policy, the existing defaults
     │   ├── solana.go             # The solana adapter: Unordered slots, and no Replacer on purpose
-    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / Replacement_* / Adapters_*, Example_askTheRegistry
+    │   ├── build.go              # The boundary of the build half: what both builders owe (every ref aboard), and why there is no Build interface
+    │   ├── evmcall.go            # settleBatch calldata by hand: ABI words, a pinned selector, strictly parsed addresses
+    │   ├── solanamsg.go          # A payout run off-chain: leaves and tree (NewRun, the Root the payer signs), then one pay_batch message per aligned block
+    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / Replacement_* / Adapters_*,
+    │                             # SettleBatchCalldata_* (cast golden, pinned selector, refusals), NewRun_* (cross-language golden root, refusals),
+    │                             # PayBatchMessage_* (the bytes rule per batch, the pinned 300-run, the proof reaching the root, blockhash, dedup),
+    │                             # Build_*, Example_askTheRegistry, Example_buildTheSameRunTwice
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
