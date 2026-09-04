@@ -30,8 +30,10 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
   plus a payout-file reader and a batch planner that turn a CSV run into the transactions the target
   chain will accept, and translate a failed batch back into the file lines it came from — every
-  per-chain rule they consult now answered by one adapter per protocol that also builds its chain's
-  unsigned transaction bytes, behind a registry that refuses a chain wired halfway.
+  per-chain rule they consult now answered by one adapter per protocol (EVM, Solana and TON) that
+  also builds its chain's unsigned bytes — a calldata, a payout-run message, or a W5 wallet request
+  that carries up to 255 jetton transfers behind one signature — behind a registry that refuses a
+  chain wired halfway.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
@@ -182,7 +184,8 @@ line either: a person can redrive it, which puts it back on the queue and starts
 | `merkle` | one root for a whole payout run, one shared proof per aligned block | `TestBuild_GoldenRootAcrossImplementations` |
 | `bulk` | how many payments fit in one transaction on a given chain, and what to fund and prepare first | `Example_packAPayoutRun` |
 | `intake` | a CSV payout file to a run: which rows go out, which are rejected and why, and which line each one came from | `Example_readAPayoutFile` |
-| `chain` | one adapter per protocol: the questions every chain must answer, and a registry that refuses half answers | `Example_askTheRegistry` |
+| `chain` | one adapter per protocol: the questions every chain must answer, a registry that refuses half answers, and each chain's unsigned bytes | `Example_askTheRegistry`, `Example_buildTheSameRunTwice`, `Example_buildATONRequest` |
+| `boc` | TON's unit of data: a cell builder and reader, the standard cell hash, and bag-of-cells bytes, pinned against `@ton/core` | `TestCell_GoldenTreeWithSharedRefAndOddBits` |
 
 ## Design notes
 
@@ -516,6 +519,32 @@ is not built yet, so `bulk`'s 262 + 74 stay estimates. Signing stays behind the 
 chains: keccak256 and secp256k1 live outside the stdlib, and outside this repo.
 `Example_buildTheSameRunTwice` builds one 12-payout list for both chains.
 
+### The TON request
+
+On EVM and Solana the relayer signs a transaction and the chain answers it: the money moves inside
+that transaction or the transaction reverts. TON has no such thing. Contracts only exchange messages,
+each message becomes its own transaction on the contract that receives it, possibly in another shard
+and another block, and a jetton payment is a chain of them: the wallet sends `transfer` to our
+jetton wallet, which sends `internal_transfer` to the merchant's jetton wallet, which credits the
+balance and sends `transfer_notification` to the merchant and `excesses` back to us (`TONHops`).
+The `ton` adapter therefore answers the same four questions with a shifted meaning. Its sequencer is
+a real `Counter` because the seqno is ours to increment, and it is not a `Replacer`: the wallet
+accepts exactly one message per seqno, external messages carry no bid, and a stuck request is resent
+byte for byte until `valid_until`. Its batch limits do not measure a transaction at all but the one
+external message the relayer signs — 255 actions per W5 request, 65,535 bytes, 512 cells deep — three
+independent rules, the first of which binds. `TransferRequest` builds that message from a
+`[]bulk.Payout`: one TEP-74 `transfer` body per payout with the ref in the `forward_payload` behind
+our own op and the ref's first eight bytes as the `query_id`, wrapped in a bounceable internal message
+carrying 0.05 TON of gas money, threaded onto a W5 `OutList`, under a signing cell whose hash is the
+only thing the relayer signs. The cells come from `boc`, a stdlib-only cell builder whose hashes and
+bytes are pinned against `@ton/core`; the request itself is pinned against `@ton/ton`'s
+`createWalletTransferV5R1` at 1, 12 and 255 payouts. What the request does not promise is atomicity:
+a batch here is transport, not a unit of failure — every message goes its own way once the wallet
+has emitted it, and a merchant whose jetton wallet rejects the transfer bounces that one payment back
+while the other 254 land. Whether a payment landed is read from the last hop, not the first, and
+that is the reader's job, not the builder's. `Example_buildATONRequest` builds the 12-payout list as
+one request and cuts a 300-payout run into two.
+
 ## Repository layout
 
 <details>
@@ -540,6 +569,10 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── table.go              # Table(): the transition table as text, pinned by the golden test
     │   ├── testdata/transitions.golden
     │   └── *_test.go             # Rules_*, Apply_*, MemoryStore_*, ref_test.go, Example_lifecycle
+    ├── boc/                      # TON's cell: builder / slice, the standard representation hash, bag-of-cells bytes, addresses
+    │   ├── boc.go                # Cell, Builder (Uint / Int / Coins / Address / Ref / MaybeRef), Slice, Hash, ToBoC, Count
+    │   ├── address.go            # Address (workchain + 256-bit hash): raw "0:hex" and user-friendly base64 with CRC16
+    │   └── boc_test.go           # golden hash + boc against @ton/core (tiny cell, shared-ref tree), coins, addr_none, limits, addresses, round trip
     ├── merkle/                   # One root for a payout run: SHA-256, domain bytes, zero padding, one shared proof per aligned block
     │   ├── merkle.go             # Leaf / PadLeaf / Build / Tree (Root, Depth, BlockProof), VerifyBlock; ErrEmptyTree
     │   └── merkle_test.go        # Build_* (padding, golden root pinned across languages), BlockProof_*, VerifyBlock_* (tamper, wrong block, reorder)
@@ -592,7 +625,7 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   └── *_test.go             # Run_* (sweep enqueue / parked / confirming, fill in the hash, swap the hash, the five findings, window, replay no-op, race), Example_reconcileWindow
     ├── bulk/                     # Cut a payout run into batches: aligned blocks for chains with a root, greedy for gas, prepare work first
     │   ├── bulk.go               # Payout, Batch (Prep included), Usage, Plan and their fixed print format; ErrEmptyRun / ErrItemTooLarge / ErrBlockTooLarge
-    │   ├── limits.go             # Rule (cap / base / item / per-level / source), Limits (Align, PrepareRules), Defaults(), MaxItems
+    │   ├── limits.go             # Rule (cap / base / item / per-level / source), Limits (Align, PrepareRules), Defaults() for evm / solana / ton, MaxItems
     │   ├── pack.go               # Pack(): greedy for Align 0, aligned blocks otherwise, prepare batches for missing accounts; ErrNoRules
     │   └── *_test.go             # Pack_* (evm one batch, solana aligned 38, order kept, prepare, rent, caps, ceiling, errors), Defaults_*, Example_packAPayoutRun
     ├── intake/                   # A CSV payout file to a run: accepted rows, rejected rows with a reason, and the line each came from
@@ -608,10 +641,13 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── build.go              # The boundary of the build half: what both builders owe (every ref aboard), and why there is no Build interface
     │   ├── evmcall.go            # settleBatch calldata by hand: ABI words, a pinned selector, strictly parsed addresses
     │   ├── solanamsg.go          # A payout run off-chain: leaves and tree (NewRun, the Root the payer signs), then one pay_batch message per aligned block
-    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / Replacement_* / Adapters_*,
+    │   ├── ton.go                # The ton adapter: a real Counter for the seqno, no Replacer (resend the same bytes), the existing defaults
+    │   ├── tonmsg.go             # A W5 wallet request: one TEP-74 transfer per payout (ref in forward_payload), an OutList of up to 255, the signing cell; TONHops
+    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / TON_* / Replacement_* / Adapters_*,
     │                             # SettleBatchCalldata_* (cast golden, pinned selector, refusals), NewRun_* (cross-language golden root, refusals),
     │                             # PayBatchMessage_* (the bytes rule per batch, the pinned 300-run, the proof reaching the root, blockhash, dedup),
-    │                             # Build_*, Example_askTheRegistry, Example_buildTheSameRunTwice
+    │                             # TransferRequest_* (signing hash pinned against @ton/ton at 1 / 12 / 255, TEP-74 read-back, every ref aboard, the three rules, the 255 cut, refusals),
+    │                             # TONPayloadOp_*, TONHops_*, Build_*, Example_askTheRegistry, Example_buildTheSameRunTwice, Example_buildATONRequest
     ├── idempotency/              # Idempotency-Key layer: scope + key + fingerprint -> one execution, one answer
     │   ├── key.go                # Scope, Key (validation), Fingerprint (sha256 of method/path/raw body)
     │   ├── store.go              # Record, Store (atomic Claim, Complete with attempt CAS), MemoryStore
