@@ -261,6 +261,28 @@ func TestPack_DoesNotTouchTheCallersSlice(t *testing.T) {
 	}
 }
 
+// 防的情境：對齊批要是還跟名單共用底層陣列，之後動一批的 Items 會悄悄改到另一批，
+// 或改到呼叫端手上那份名單，而兩邊都看不出來哪裡出了錯。批次本來就該各自獨立。
+func TestPack_BatchesOwnTheirItems(t *testing.T) {
+	items := payouts(20, 0)
+	plan, err := bulk.Pack(items, bulk.Defaults()["solana"])
+	if err != nil {
+		t.Fatalf("Pack: %v", err)
+	}
+	if len(plan.Batches) < 2 {
+		t.Fatalf("got %d batches, want at least 2", len(plan.Batches))
+	}
+	before := items[8].Merchant
+	plan.Batches[0].Items[0].Merchant = "mutated"
+	if items[0].Merchant == "mutated" {
+		t.Fatalf("mutating a batch's Items changed the caller's slice")
+	}
+	plan.Batches[1].Items[0].Merchant = "mutated"
+	if items[8].Merchant != before {
+		t.Fatalf("mutating a batch's Items changed the caller's slice")
+	}
+}
+
 // 防的情境：一筆也是一輪。單獨一筆在 Solana 上還是一棵（墊滿的）樹加一批，
 // 只是區塊自己就是整棵樹，證明剛好零個雜湊。
 func TestPack_ASingleItemIsStillOneBatch(t *testing.T) {

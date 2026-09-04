@@ -99,7 +99,9 @@ func packAligned(plan *Plan, items []Payout, l Limits) error {
 		if end > len(items) {
 			end = len(items)
 		}
-		batch := Batch{Index: len(plan.Batches) + 1, Items: items[start:end]}
+		batchItems := make([]Payout, end-start)
+		copy(batchItems, items[start:end])
+		batch := Batch{Index: len(plan.Batches) + 1, Items: batchItems}
 		batch.Used = make([]Usage, len(l.Rules))
 		for j, r := range l.Rules {
 			batch.Used[j] = Usage{
