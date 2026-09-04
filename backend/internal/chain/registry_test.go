@@ -66,24 +66,24 @@ func TestRegistry_FindsTheAdapterByProtocol(t *testing.T) {
 // 而且訊息裡要有協定名，值班的人才知道是哪條鏈沒接。
 func TestRegistry_RejectsAChainWithNoAdapter(t *testing.T) {
 	reg := chain.Default()
-	_, err := reg.For("ton:mainnet")
+	_, err := reg.For("sui:mainnet")
 	if !errors.Is(err, chain.ErrUnknownChain) {
-		t.Fatalf("For(ton:mainnet) = %v, want ErrUnknownChain", err)
+		t.Fatalf("For(sui:mainnet) = %v, want ErrUnknownChain", err)
 	}
-	if !strings.Contains(err.Error(), `"ton"`) {
+	if !strings.Contains(err.Error(), `"sui"`) {
 		t.Fatalf("the error should name the protocol: %v", err)
 	}
 }
 
 // TestRegistry_APolicyAloneIsNotAnAdapter 釘住這個 package 存在的理由：finality.Defaults()
-// 認識 ton，但一份不可逆規則不等於一條接好的鏈，Registry 對它照樣回 ErrUnknownChain。
+// 認識 sui，但一份不可逆規則不等於一條接好的鏈，Registry 對它照樣回 ErrUnknownChain。
 func TestRegistry_APolicyAloneIsNotAnAdapter(t *testing.T) {
-	if _, ok := finality.Defaults()["ton"]; !ok {
-		t.Fatalf("the premise broke: finality.Defaults() no longer knows ton")
+	if _, ok := finality.Defaults()["sui"]; !ok {
+		t.Fatalf("the premise broke: finality.Defaults() no longer knows sui")
 	}
-	_, err := chain.Default().For("ton:mainnet")
+	_, err := chain.Default().For("sui:mainnet")
 	if !errors.Is(err, chain.ErrUnknownChain) {
-		t.Fatalf("For(ton:mainnet) = %v, want ErrUnknownChain", err)
+		t.Fatalf("For(sui:mainnet) = %v, want ErrUnknownChain", err)
 	}
 }
 
@@ -146,7 +146,7 @@ func TestRegistry_AcceptsACompleteAdapter(t *testing.T) {
 // TestRegistry_ListsProtocolsSorted 釘住 Protocols 的輸出穩定：報告與錯誤訊息會印它。
 func TestRegistry_ListsProtocolsSorted(t *testing.T) {
 	ps := chain.Default().Protocols()
-	if len(ps) != 2 || ps[0] != "evm" || ps[1] != "solana" {
-		t.Fatalf("Protocols() = %v, want [evm solana]", ps)
+	if len(ps) != 3 || ps[0] != "evm" || ps[1] != "solana" || ps[2] != "ton" {
+		t.Fatalf("Protocols() = %v, want [evm solana ton]", ps)
 	}
 }

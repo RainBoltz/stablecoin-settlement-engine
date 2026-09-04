@@ -41,12 +41,13 @@ type Limits struct {
 	RentUnit       string
 }
 
-// Defaults 是四條鏈裡目前有實作的那兩條。其他兩條之後再補。
+// Defaults 是四條鏈裡目前有實作的三條。SUI 之後再補。
 //
-// 兩條鏈的規則數不一樣，這是刻意的：EVM 上一筆交易裝得下多少完全由 gas 決定，
-// Solana 上 gas 這種東西不存在，換成「交易本身有多長」與「它列出了幾個帳戶」兩個各自獨立的上限。
-// Solana 這裡的 Base 與 Item 是照 pay_batch 那種交易的形狀逐個欄位加出來的估算，
-// 每一個加項都寫在註解裡；真正序列化出來的長度以送出前組好的那筆為準，這裡寧可高估。
+// 三條鏈的規則數不一樣，這是刻意的：EVM 上一筆交易裝得下多少完全由 gas 決定，
+// Solana 上 gas 這種東西不存在，換成「交易本身有多長」與「它列出了幾個帳戶」兩個各自獨立的上限；
+// TON 上限制的根本不是付款，是 relayer 送給錢包合約的那一則 external message：裝幾則 message、幾個 bytes、
+// cell 樹幾層深，三條各自獨立。Solana 這裡的 Base 與 Item 是照 pay_batch 那種交易的形狀逐個欄位
+// 加出來的估算，每一個加項都寫在註解裡；真正序列化出來的長度以送出前組好的那筆為準，這裡寧可高估。
 func Defaults() map[string]Limits {
 	return map[string]Limits{
 		"evm": {
@@ -57,7 +58,7 @@ func Defaults() map[string]Limits {
 				// limit 是網路壅塞時才撐得開的彈性上限，撥款沒有理由去搶那段空間。
 				// https://ethereum.org/en/developers/docs/blocks/#block-size
 				Cap: 30_000_000,
-				// Base 與 Item 是從結算合約的批次入口實跑的 gas report 反推的：
+				// Base 與 Item 是從結算合約的 batch 入口實跑的 gas report 反推的：
 				// 一項 90,530、兩百項 10,681,008，所以每多一項約 53,220，固定開銷約 37,310。
 				Base:     37_310,
 				Item:     53_220,
@@ -135,6 +136,56 @@ func Defaults() map[string]Limits {
 			// https://solana.com/docs/core/accounts
 			NewAccountRent: 2_039_280,
 			RentUnit:       "lamports",
+		},
+		"ton": {
+			Chain: "ton",
+			// 貪心切法，跟 EVM 一樣：這條鏈上「一批」只是一則 external message 裝了幾則付款 message，
+			// 沒有樹、沒有證明，也沒有整批一起成功或失敗這回事，每一則 message 送出去之後各走各的。
+			Rules: []Rule{
+				{
+					Unit: "messages",
+					// W5 錢包一則請求最多送 255 則：錢包對照表寫「Up to 255 per request」（v4 是 4），
+					// 跟 TVM 對一筆交易 action list 的上限同一個數字，超過的是整筆錢包交易失敗
+					//（exit code 33，https://docs.ton.org/tvm/exit-codes），不是前 255 則照送。
+					Cap:      255,
+					Base:     0,
+					Item:     1,
+					PerLevel: 0,
+					Source:   "https://docs.ton.org/contracts/standard/wallets/comparison",
+				},
+				{
+					Unit: "bytes",
+					// 「Maximum external message size in bytes | 65535」：節點對一則 external message 序列化之後的長度
+					// 上限。付款是 internal message，各自另外算，這條管的只有 relayer 那一則。
+					Cap: 65535,
+					// Base 是一則 external message 不裝任何付款也要付的：BoC 的表頭 20、signing cell（opcode、wallet_id、
+					// valid_until、seqno 與兩個旗標 bit）21、空的動作清單 2，共 43 bytes；再加 512 bits 的簽名
+					// 64 bytes 與 external message 表頭（收件的錢包地址、import_fee、兩個旗標 bit）35 bytes，共 142。
+					Base: 142,
+					// Item 是每多一則付款 message：一格動作 cell（tag 4、mode 1、兩個 ref）、一個 MessageRelaxed
+					//（表頭、jetton wallet 地址、附上的 TON、四個零欄位）、一個 transfer body（op、query_id、
+					// 金額、兩個地址、forward 金額）、一個 forward_payload（op 加 32 bytes 的 ref），
+					// 序列化之後 190 到 194 bytes，cell 超過 255 個之後每個 ref 的索引多一個 byte，取多的那一端。
+					Item:     194,
+					PerLevel: 0,
+					Source:   "https://docs.ton.org/foundations/limits",
+				},
+				{
+					Unit: "depth",
+					// 「Maximum external message depth | 512」：cell 樹最深幾層。動作清單是一條鏈結串列，
+					// 一則 message 就多一層，所以這條也是線性的：signing cell 加最深那則 message 自己的三層是 3，
+					// 之後一則加一層。255 則是 258 層，離 512 還遠，但它跟 bytes 一樣是獨立的上限，得各算各的。
+					Cap:      512,
+					Base:     3,
+					Item:     1,
+					PerLevel: 0,
+					Source:   "https://docs.ton.org/foundations/limits",
+				},
+			},
+			// TON 上沒有 rent 這種先墊的錢：merchant 沒有 jetton wallet 的話，我們的 jetton wallet 會在
+			// 轉帳那一步順便部署它，儲存費從每一則 message 附上的 TON 裡出，有沒有帳戶每一則都一樣貴。
+			NewAccountRent: 0,
+			RentUnit:       "nanoton",
 		},
 	}
 }

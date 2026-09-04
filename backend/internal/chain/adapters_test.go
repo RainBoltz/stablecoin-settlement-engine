@@ -63,9 +63,31 @@ func TestSolana_NeedsNoSlot(t *testing.T) {
 	}
 }
 
-// TestReplacement_EVMCanAndSolanaCannot 釘住替換是選答題：evm 交得出規則，
-// solana 連介面都沒實作，呼叫端拿到一個乾脆的 false，沒有零值規則這種東西。
-func TestReplacement_EVMCanAndSolanaCannot(t *testing.T) {
+// TestTON_HandsOutOrderedSlotsLikeEVM 釘住 ton 那一題的答案跟 evm 是同一種：seqno 是發送方
+// 自己往上加的，所以是一個真的發號器，而且跟 evm 一樣每次交出同一個實例。
+func TestTON_HandsOutOrderedSlotsLikeEVM(t *testing.T) {
+	ctx := context.Background()
+	a := chain.NewTON()
+	if a.Sequencer() != a.Sequencer() {
+		t.Fatalf("Sequencer() should hand back the same instance every time")
+	}
+	wallet := "0:1111111111111111111111111111111111111111111111111111111111111111"
+	res, err := a.Sequencer().Reserve(ctx, wallet)
+	if err != nil {
+		t.Fatalf("Reserve: %v", err)
+	}
+	if !res.Ordered || res.Value != 0 {
+		t.Fatalf("reservation = %+v, want ordered #0", res)
+	}
+	if err := a.Sequencer().Resolve(ctx, res, txseq.SentYes); err != nil {
+		t.Fatalf("Resolve: %v", err)
+	}
+}
+
+// TestReplacement_OnlyEVMCan 釘住替換是選答題：evm 交得出規則，solana 與 ton 連介面都沒實作，
+// 呼叫端拿到一個乾脆的 false，沒有零值規則這種東西。ton 尤其容易被誤答：它跟 evm 一樣自己發號，
+// 但錢包合約對同一個 seqno 只收一則，而 external message 沒有出價可以加，卡住只能原封不動重送。
+func TestReplacement_OnlyEVMCan(t *testing.T) {
 	pol, ok := chain.Replacement(chain.NewEVM())
 	if !ok {
 		t.Fatalf("evm should be able to replace")
@@ -76,13 +98,16 @@ func TestReplacement_EVMCanAndSolanaCannot(t *testing.T) {
 	if _, ok := chain.Replacement(chain.NewSolana()); ok {
 		t.Fatalf("solana must not answer the replacement question")
 	}
+	if _, ok := chain.Replacement(chain.NewTON()); ok {
+		t.Fatalf("ton must not answer the replacement question")
+	}
 }
 
 // TestAdapters_AnswerWithTheRulesThatAlreadyExist 釘住「adapter 只當索引」：
-// 兩個 adapter 交出來的規則就是 finality.Defaults() 與 bulk.Defaults() 裡的那幾條本人，
+// 三個 adapter 交出來的規則就是 finality.Defaults() 與 bulk.Defaults() 裡的那幾條本人，
 // 一個數字都不自己抄。誰改了那兩份設定，這裡自動跟著變，不會出現兩個版本。
 func TestAdapters_AnswerWithTheRulesThatAlreadyExist(t *testing.T) {
-	for _, a := range []chain.Adapter{chain.NewEVM(), chain.NewSolana()} {
+	for _, a := range []chain.Adapter{chain.NewEVM(), chain.NewSolana(), chain.NewTON()} {
 		p := a.Protocol()
 		if got, want := a.Finality(), finality.Defaults()[p]; got != want {
 			t.Fatalf("%s finality = %+v, want the finality.Defaults entry %+v", p, got, want)
