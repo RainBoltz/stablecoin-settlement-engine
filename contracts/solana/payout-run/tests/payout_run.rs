@@ -351,6 +351,29 @@ fn hex(bytes: &[u8; 32]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
 
+/// 防的情境：兩種語言各編各的葉子。上面那條 golden 釘的是樹的算法，這條釘的是
+/// 「一筆付款怎麼變成一片葉子」：編號 u16 LE、token 帳戶 32、金額 u64 LE、ref 32。
+/// 同一個固定輸入在 Go 那一側釘在 internal/chain 的 TestNewRun_GoldenRootAcrossImplementations，
+/// 兩邊只要有一個 byte 的編碼歧義，root 就對不上，payer 簽的承諾就付不出去。
+#[test]
+fn golden_payout_leaves_match_the_go_side() {
+    let leaves: Vec<[u8; 32]> = (0..12u16)
+        .map(|i| {
+            payout_leaf(
+                i,
+                &Pubkey::new_from_array([i as u8 + 1; 32]),
+                1_000_000 * (i as u64 + 1),
+                &[0x10 + i as u8; 32],
+            )
+        })
+        .collect();
+    let tree = build(&leaves);
+    assert_eq!(
+        hex(&tree.root()),
+        "4e6fa44a1987a3ef74cc6cc2befc3bf6ae7b3f0ec5477bde1b94633974f13f0c"
+    );
+}
+
 /// 防的情境：圈存拿錯數目。init_run 之後 vault 裡剛好是 total，payer 手上剩 fund - total，
 /// 一毛不多一毛不少。
 #[tokio::test]
