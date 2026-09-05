@@ -1,0 +1,7 @@
+[package]
+name = "settlement"
+edition = "2024"
+license = "MIT"
+
+# Sui 與 MoveStdlib 是 CLI 帶進來的隱含依賴，不用在這裡宣告；版本由 Move.lock 記住。
+[dependencies]

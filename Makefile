@@ -1,4 +1,4 @@
-.PHONY: help test evm-build evm-test evm-test-fork ton-test go-test api-run devnet devnet-down devnet-reset devnet-seed devnet-status devnet-logs
+.PHONY: help test evm-build evm-test evm-test-fork ton-test sui-build sui-test go-test api-run devnet devnet-down devnet-reset devnet-seed devnet-status devnet-logs
 
 help:
 	@echo "make test            everything that runs offline: evm-test + go-test"
@@ -6,6 +6,8 @@ help:
 	@echo "make evm-test        run the offline Solidity test suite (fork tests are skipped)"
 	@echo "make evm-test-fork   run the mainnet-fork tests; needs ETH_RPC_URL"
 	@echo "make ton-test        the Go-built W5 request against the real W5 wallet and real jetton contracts in @ton/sandbox; needs node"
+	@echo "make sui-build       compile the Move settlement module in contracts/sui/settlement; needs the sui CLI"
+	@echo "make sui-test        run the Move unit tests of contracts/sui/settlement; needs the sui CLI"
 	@echo "make go-test         vet + test the Go backend (backend/)"
 	@echo "make api-run         start the Payment API on 127.0.0.1:8080 (memory stores, no chain)"
 	@echo "make devnet          start anvil + deploy + seed (idempotent, state persists in .devnet/)"
@@ -30,6 +32,12 @@ evm-test-fork:
 ton-test:
 	cd contracts/ton && (test -d node_modules || npm ci --no-audit --no-fund) && npm test
 	cd backend && go test -count=1 -run 'TestTONSandbox' ./internal/chain/
+
+sui-build:
+	cd contracts/sui/settlement && sui move build --build-env testnet
+
+sui-test:
+	cd contracts/sui/settlement && sui move test --build-env testnet
 
 go-test:
 	cd backend && go vet ./... && go test ./...
