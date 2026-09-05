@@ -228,9 +228,9 @@ func TestPack_RejectsAnEmptyRun(t *testing.T) {
 	}
 }
 
-// 防的情境：拿 Defaults() 查一條還沒實作的鏈，拿到零值就往下走。
+// 防的情境：拿 Defaults() 查一條沒有實作的鏈，拿到零值就往下走。
 func TestPack_RejectsAChainWithNoLimits(t *testing.T) {
-	if _, err := bulk.Pack(payouts(1, 0), bulk.Defaults()["sui"]); !errors.Is(err, bulk.ErrNoRules) {
+	if _, err := bulk.Pack(payouts(1, 0), bulk.Defaults()["aptos"]); !errors.Is(err, bulk.ErrNoRules) {
 		t.Fatalf("err = %v, want ErrNoRules", err)
 	}
 }

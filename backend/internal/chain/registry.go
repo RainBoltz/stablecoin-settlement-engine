@@ -76,12 +76,12 @@ func (r *Registry) Protocols() []string {
 	return ps
 }
 
-// Default 回一個註冊了目前有實作的三條鏈的 Registry。SUI 之後再補。
+// Default 回一個註冊了四條鏈的 Registry。
 //
-// 這裡的 panic 走不到：三個 adapter 的完整性都有測試釘住，會炸的唯一情況是有人改壞了
+// 這裡的 panic 走不到：四個 adapter 的完整性都有測試釘住，會炸的唯一情況是有人改壞了
 // 其中一個 adapter 又沒跑測試，而那正是應該炸的情況。
 func Default() *Registry {
-	r, err := NewRegistry(NewEVM(), NewSolana(), NewTON())
+	r, err := NewRegistry(NewEVM(), NewSolana(), NewTON(), NewSUI())
 	if err != nil {
 		panic(err)
 	}

@@ -41,13 +41,14 @@ type Limits struct {
 	RentUnit       string
 }
 
-// Defaults 是四條鏈裡目前有實作的三條。SUI 之後再補。
+// Defaults 是四條鏈各自的上限，以協定名為 key。
 //
-// 三條鏈的規則數不一樣，這是刻意的：EVM 上一筆交易裝得下多少完全由 gas 決定，
+// 四條鏈的規則數不一樣，這是刻意的：EVM 上一筆交易裝得下多少完全由 gas 決定，
 // Solana 上 gas 這種東西不存在，換成「交易本身有多長」與「它列出了幾個帳戶」兩個各自獨立的上限；
 // TON 上限制的根本不是付款，是 relayer 送給錢包合約的那一則 external message：裝幾則 message、幾個 bytes、
-// cell 樹幾層深，三條各自獨立。Solana 這裡的 Base 與 Item 是照 pay_batch 那種交易的形狀逐個欄位
-// 加出來的估算，每一個加項都寫在註解裡；真正序列化出來的長度以送出前組好的那筆為準，這裡寧可高估。
+// cell 樹幾層深，三條各自獨立；SUI 上一批就是一個 PTB，裝幾個 command、幾個 bytes、生出幾個 object，
+// 同樣三條各自獨立。Solana 與 SUI 這裡的 Base 與 Item 是照那種交易的形狀逐個欄位加出來的估算，
+// 每一個加項都寫在註解裡；真正序列化出來的長度以送出前組好的那筆為準，這裡寧可高估。
 func Defaults() map[string]Limits {
 	return map[string]Limits{
 		"evm": {
@@ -186,6 +187,61 @@ func Defaults() map[string]Limits {
 			// 轉帳那一步順便部署它，儲存費從每一則 message 附上的 TON 裡出，有沒有帳戶每一則都一樣貴。
 			NewAccountRent: 0,
 			RentUnit:       "nanoton",
+		},
+		"sui": {
+			Chain: "sui",
+			// 貪心切法：一批就是一個 PTB，payer 簽一次、整個 PTB 一起成功或失敗
+			//（「If one transaction command fails, the entire block fails and no effects from the commands
+			// are applied.」，https://docs.sui.io/concepts/transactions/prog-txn-blocks），跟 EVM 的 settleBatch
+			// 同一種形狀，但塞的是 command 不是 calldata。三條規則管的都是同一個 PTB。
+			Rules: []Rule{
+				{
+					Unit: "commands",
+					// 「A PTB can perform up to 1,024 unique operations in a single execution」：
+					// protocol config 裡叫 max_programmable_tx_commands。
+					Cap: 1024,
+					// Base 是切 coin 的那一個 SplitCoins：一個 command 一次切出整批要付的每一顆。
+					Base: 1,
+					// Item 是每一筆付款一個 MoveCall：settlement::pay 帶著切好的那顆 coin。
+					Item:     1,
+					PerLevel: 0,
+					Source:   "https://docs.sui.io/concepts/transactions/prog-txn-blocks",
+				},
+				{
+					Unit: "bytes",
+					// max_tx_size_bytes = 128 * 1024：序列化之後的 TransactionData 不能超過這個長度。
+					Cap: 131072,
+					// Base 是一個 PTB 不管付幾筆都要付的：TransactionData 與 kind 的 tag 各 1、inputs 與 commands
+					// 的長度各算 2（超過 127 就兩個 byte）、Book 與 payer 那顆 coin 兩個 owned object 輸入各 75
+					//（tag 2、id 32、version 8、digest 33）、SplitCoins 自己 6（tag 1、coin 引數 3、清單長度 2）、
+					// sender 32、GasData 122（一個 gas coin 74、sponsor 32、price 8、budget 8）、expiration 1。
+					Base: 317,
+					// Item 是每多一筆付款：三個 pure 輸入（金額 10、merchant 34、ref 35）、SplitCoins 清單裡
+					// 多一個引數 3、以及一個 MoveCall 108（tag 1、package 32、模組名 11、函式名 4、
+					// 一個 type argument 45、四個引數 15：Book 與兩個 pure 各 3，切出來的那顆 coin 是
+					// NestedResult 要 5）。
+					Item:     190,
+					PerLevel: 0,
+					Source:   "https://github.com/MystenLabs/sui/blob/mainnet-v1.78.1/crates/sui-protocol-config/src/lib.rs",
+				},
+				{
+					Unit: "objects",
+					// max_num_new_move_object_ids = 2048：一筆交易最多生出這麼多新的 object id，
+					// 同一份設定裡 max_num_transferred_move_object_ids 也是 2048。
+					Cap: 2048,
+					// Base 是 0：Book 與 payer 的 coin 都是既有的 object，改它們不生新的 id。
+					Base: 0,
+					// Item 是每一筆付款生出的兩個 object：SplitCoins 切給 merchant 的那顆 coin，
+					// 加上 Book 的 Table 裡記這把 ref 的那個 dynamic field。
+					Item:     2,
+					PerLevel: 0,
+					Source:   "https://github.com/MystenLabs/sui/blob/mainnet-v1.78.1/crates/sui-protocol-config/src/lib.rs",
+				},
+			},
+			// SUI 上沒有替 merchant 開帳戶這件事：付過去的錢自己就是一個新的 Coin object，歸 merchant 所有。
+			// 生出這個 object 的 storage 費用由這筆交易的 gas 出，object 之後被合併或刪掉時退 99%。
+			NewAccountRent: 0,
+			RentUnit:       "mist",
 		},
 	}
 }

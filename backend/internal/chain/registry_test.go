@@ -63,25 +63,31 @@ func TestRegistry_FindsTheAdapterByProtocol(t *testing.T) {
 }
 
 // TestRegistry_RejectsAChainWithNoAdapter 釘住「查不到不給預設」：錯誤要包 ErrUnknownChain，
-// 而且訊息裡要有協定名，值班的人才知道是哪條鏈沒接。
+// 而且訊息裡要有協定名，值班的人才知道是哪條鏈沒接。四條鏈都接齊之後，拿一條這個系統
+// 從來沒有打算接的鏈來問。
 func TestRegistry_RejectsAChainWithNoAdapter(t *testing.T) {
 	reg := chain.Default()
-	_, err := reg.For("sui:mainnet")
+	_, err := reg.For("aptos:mainnet")
 	if !errors.Is(err, chain.ErrUnknownChain) {
-		t.Fatalf("For(sui:mainnet) = %v, want ErrUnknownChain", err)
+		t.Fatalf("For(aptos:mainnet) = %v, want ErrUnknownChain", err)
 	}
-	if !strings.Contains(err.Error(), `"sui"`) {
+	if !strings.Contains(err.Error(), `"aptos"`) {
 		t.Fatalf("the error should name the protocol: %v", err)
 	}
 }
 
 // TestRegistry_APolicyAloneIsNotAnAdapter 釘住這個 package 存在的理由：finality.Defaults()
-// 認識 sui，但一份不可逆規則不等於一條接好的鏈，Registry 對它照樣回 ErrUnknownChain。
+// 認識 sui，但一份不可逆規則不等於一條接好的鏈。一個沒註冊 sui adapter 的 Registry
+// 對 sui:mainnet 照樣回 ErrUnknownChain，不會因為別的 package 認得它就放行。
 func TestRegistry_APolicyAloneIsNotAnAdapter(t *testing.T) {
 	if _, ok := finality.Defaults()["sui"]; !ok {
 		t.Fatalf("the premise broke: finality.Defaults() no longer knows sui")
 	}
-	_, err := chain.Default().For("sui:mainnet")
+	reg, err := chain.NewRegistry(chain.NewEVM(), chain.NewSolana(), chain.NewTON())
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	_, err = reg.For("sui:mainnet")
 	if !errors.Is(err, chain.ErrUnknownChain) {
 		t.Fatalf("For(sui:mainnet) = %v, want ErrUnknownChain", err)
 	}
@@ -146,7 +152,7 @@ func TestRegistry_AcceptsACompleteAdapter(t *testing.T) {
 // TestRegistry_ListsProtocolsSorted 釘住 Protocols 的輸出穩定：報告與錯誤訊息會印它。
 func TestRegistry_ListsProtocolsSorted(t *testing.T) {
 	ps := chain.Default().Protocols()
-	if len(ps) != 3 || ps[0] != "evm" || ps[1] != "solana" || ps[2] != "ton" {
-		t.Fatalf("Protocols() = %v, want [evm solana ton]", ps)
+	if len(ps) != 4 || ps[0] != "evm" || ps[1] != "solana" || ps[2] != "sui" || ps[3] != "ton" {
+		t.Fatalf("Protocols() = %v, want [evm solana sui ton]", ps)
 	}
 }

@@ -19,11 +19,11 @@ func commas(n uint64) string {
 	return s
 }
 
-// Example_askTheRegistry 先拿四筆 intent 的鏈名去查 adapter，再把查得到的三個 adapter
+// Example_askTheRegistry 先拿四筆 intent 的鏈名去查 adapter，再把四個 adapter
 // 各問一輪：取一個位置、能不能替換、什麼算不可逆、一筆交易裝得下多少。
-// 每一行都是鏈下某個元件真的會問的問題；sui 那一行就是沒接的鏈在這個系統裡的長相。
-// ton 的四行乍看跟 evm 沒兩樣，差別在「一筆交易」指的東西：最後那一行數的是一則 external message
-// 裝幾則付款 message，而不是一筆交易裡有幾筆付款。
+// 每一行都是鏈下某個元件真的會問的問題。四條鏈今天第一次到齊，而四條的答案沒有兩條完全一樣：
+// ton 的最後一行數的是一則 external message 裝幾則付款 message，sui 的最後一行數的是一個 PTB
+// 裝幾個 command，兩個都不是「一筆交易裡有幾筆付款」。
 func Example_askTheRegistry() {
 	ctx := context.Background()
 	reg := chain.Default()
@@ -43,6 +43,7 @@ func Example_askTheRegistry() {
 		"evm":    "0x0A11cE0000000000000000000000000000000001",
 		"solana": "payer-wallet",
 		"ton":    "0:1111111111111111111111111111111111111111111111111111111111111111",
+		"sui":    "payer-address",
 	}
 	for _, p := range reg.Protocols() {
 		a, _ := reg.For(p)
@@ -63,11 +64,11 @@ func Example_askTheRegistry() {
 	}
 
 	// Output:
-	// registry evm, solana, ton
+	// registry evm, solana, sui, ton
 	// evm:31337            -> evm
 	// solana:mainnet-beta  -> solana
 	// ton:mainnet          -> ton
-	// sui:mainnet          -> chain: no adapter registered for this protocol: "sui"
+	// sui:mainnet          -> sui
 	//
 	// evm     slot     0x0A11…0001 #0
 	// evm     replace  cap 30.000 gwei tip 2.000 gwei, bump 10%, ceiling 45.000 gwei, at most 3 broadcasts
@@ -77,6 +78,10 @@ func Example_askTheRegistry() {
 	// solana  replace  resend the same signed bytes
 	// solana  final    final when finalized; lost after 2m0s
 	// solana  batch    bytes cap 1,232, accounts cap 64
+	// sui     slot     no slot needed
+	// sui     replace  resend the same signed bytes
+	// sui     final    final when checkpoint; lost after 2m0s
+	// sui     batch    commands cap 1,024, bytes cap 131,072, objects cap 2,048
 	// ton     slot     0:1111111111111111111111111111111111111111111111111111111111111111 #0
 	// ton     replace  resend the same signed bytes
 	// ton     final    final when masterchain; lost after 2m0s
