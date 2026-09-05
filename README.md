@@ -20,7 +20,11 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   the mocks — the wrapper and the Permit2 path included — against the real thing. On Solana, the
   `payout-run` program locks a whole payout run behind one signature: fund the vault and pin the
   run's merkle root once, let a relayer pay verified blocks of eight, claw back what is left after
-  the deadline — accounts closed, rent recovered.
+  the deadline — accounts closed, rent recovered. On Sui, the `settlement` Move module keeps the
+  same rules on a chain where money is an object and the runtime, not the module, decides who may
+  move it: `pay` hands a `Coin<T>` to the merchant behind a per-payer replay guard the payer owns (a
+  `Book`), and `hold` locks a `Balance<T>` inside a shared `Hold` object that an `OperatorCap`
+  releases with a fee split, or the payer refunds in full once the deadline has passed.
 - **Payment core** — the Payment Intent state machine with a pinned transition table and a CAS store,
   the PaymentRef commitment, and an append-only hash-chained double-entry ledger.
 - **Delivery** — an at-least-once job queue, a relayer worker pool with graceful drain and a throttle,
@@ -30,24 +34,27 @@ the engine cannot decide safely goes to a person instead of being guessed at.
   engine that sweeps the intents nobody is driving and matches every finalized transfer back by ref,
   plus a payout-file reader and a batch planner that turn a CSV run into the transactions the target
   chain will accept, and translate a failed batch back into the file lines it came from — every
-  per-chain rule they consult now answered by one adapter per protocol (EVM, Solana and TON) that
-  also builds its chain's unsigned bytes — a calldata, a payout-run message, or a W5 wallet request
-  that carries up to 255 jetton transfers behind one signature — behind a registry that refuses a
-  chain wired halfway; on TON the adapter also reads: it follows every payment hop by hop to the
-  merchant's jetton wallet before the listener may call it settled, and it reconciles at that same
-  hop so a payment counts once.
+  per-chain rule they consult now answered by one adapter per protocol (EVM, Solana, TON and SUI),
+  three of which also build their chain's unsigned bytes — a calldata, a payout-run message, or a W5
+  wallet request that carries up to 255 jetton transfers behind one signature — behind a registry
+  that refuses a chain wired halfway; on TON the adapter also reads: it follows every payment hop by
+  hop to the merchant's jetton wallet before the listener may call it settled, and it reconciles at
+  that same hop so a payment counts once.
 - **HTTP** — `POST /v1/payment_intents` behind an Idempotency-Key layer, plus lookup by intent id and
   by ref.
 
 The sender is still a fake on every chain, and so are the watcher and the recon source on EVM and
 Solana; `chain` pins what an adapter must answer before it may exist, TON's `TONReader` is the first
 read half that follows a payment through the chain's own transactions (against an in-memory node for
-now), and the RPC-backed implementations land behind it as the series progresses.
+now), the SUI adapter answers the four questions but builds no bytes yet, and the RPC-backed
+implementations land behind it as the series progresses.
 
 ## Quick start
 
 Requires [Foundry](https://getfoundry.sh) >= 1.3.0 (`anvil_dealERC20` was added there), `jq`, and
-[Go](https://go.dev/dl/) >= 1.24 for `backend/`.
+[Go](https://go.dev/dl/) >= 1.24 for `backend/`. The Move module under `contracts/sui/` needs the
+[Sui CLI](https://docs.sui.io/guides/developer/getting-started/sui-install) (`sui move test`), which
+`make test` does not require.
 
 ```bash
 curl -L https://foundry.paradigm.xyz | bash && foundryup   # if you do not have Foundry yet
@@ -77,6 +84,8 @@ cd backend && go test ./internal/... -run Example -v
 | `make evm-test` | the Solidity suite; the mainnet-fork tests are skipped |
 | `make evm-test-fork` | the mainnet-fork faithfulness tests; needs `ETH_RPC_URL` |
 | `make ton-test` | the Go-built W5 request against the real W5 wallet and real jetton contracts in `@ton/sandbox`; needs node (the first run does `npm ci`) |
+| `make sui-build` | compile the Move settlement module in `contracts/sui/settlement`; needs the `sui` CLI |
+| `make sui-test` | the Move unit tests of `contracts/sui/settlement`; needs the `sui` CLI |
 | `make go-test` | `go vet` + `go test` for `backend/` |
 | `make api-run` | the Payment API on `http://127.0.0.1:8080`, memory stores, no chain |
 | `make devnet` | start anvil, deploy the Token Zoo, seed balances; state persists in `.devnet/` |
@@ -594,6 +603,34 @@ as the reader, so `make ton-test` also records every transaction of its sandbox 
 `boc` and must hash to what `@ton/core` computed, and the delivered, refused and bounced traces, the
 observations and the reconciliation have to come out the same on the real contracts' output as on the fake.
 
+### The Sui settlement module
+
+The EVM contract is a place: money passes through it, its state lives in it, and `msg.sender`
+decides who may call which door. Sui has no such place. Money is a `Coin<T>` object owned by an
+address, and an address-owned object can only enter a transaction that its owner signed — the runtime
+enforces that before any Move code runs. So the two doors that lived on an allowance (`settle`,
+`settleWithPermit`) do not exist in `contracts/sui/settlement`; what remains is `pay`, where the
+payer hands in a `Coin<T>` and the module records the ref, emits `Paid<T>` (with the gas sponsor, if
+any, in place of the EVM `msg.sender`) and transfers the coin to the merchant, and `hold`, where the
+coin's `Balance<T>` moves into a `Hold<T>` object instead. The state had to be given a home too. The
+EVM `paid` mapping is global for free; here it is an object, and whose object it is sets its cost: a
+network-wide shared object would sequence every payment through consensus on one hot object and let
+a stranger burn our refs first, so the replay guard is a `Book` per payer, owned by the payer, `key`
+without `store` so it can never leave that address. It guards what this engine actually defends
+against — the same payer paying the same ref twice, by retry or redelivery — and leaves a stranger's
+payment carrying our ref to reconciliation, which files it as `unexpected` on every chain. The
+price is written on the object: two of the payer's transactions in flight at once would race for the
+same `Book` version, which is why a payout run goes into one transaction. `Hold<T>` is the opposite
+case — the operator releases it, the payer refunds it after the deadline, so both must reach it and
+it is shared — and a shared object is open to anyone, so authority is a `OperatorCap` object rather
+than an address check: `release` and an early `refund` take the cap as their first argument, while
+`refund_expired` asks the `Clock` and the sender. Amounts are the coin's face value (no
+fee-on-transfer to check), the fee is split at `release`, an expired hold refunds in full, and a
+refunded ref stays spent. The `sui` adapter answers the four questions with `txseq.Unordered`, the
+`checkpoint` finality policy and three independent PTB limits — 1,024 commands, 128 KB, 2,048 new
+object ids — of which the bytes rule binds first, at 688 payouts. `make sui-test` runs the eighteen
+Move tests in `contracts/sui/settlement/tests/`.
+
 ## Repository layout
 
 <details>
@@ -692,10 +729,11 @@ backend/                          # Go module (stdlib only so far), go 1.24
     │   ├── evmcall.go            # settleBatch calldata by hand: ABI words, a pinned selector, strictly parsed addresses
     │   ├── solanamsg.go          # A payout run off-chain: leaves and tree (NewRun, the Root the payer signs), then one pay_batch message per aligned block
     │   ├── ton.go                # The ton adapter: a real Counter for the seqno, no Replacer (resend the same bytes), the existing defaults
+    │   ├── sui.go                # The sui adapter: Unordered slots (the object version is the slot), no Replacer (equivocation), the existing defaults
     │   ├── tonmsg.go             # A W5 wallet request: one TEP-74 transfer per payout (ref in forward_payload), an OutList of up to 255, the signing cell; TONHops
     │   ├── tonread.go            # TON's read half: TONMessage / TONTransaction / TONNode, Trace (hop by hop to the terminal transaction), TONReader as Watcher and Source
     │   ├── testdata/tonsandbox/  # Recorded by `make ton-test`: every transaction of the sandbox scenarios against the real W5 and jetton contracts
-    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / TON_* / Replacement_* / Adapters_*,
+    │   └── *_test.go             # Registry_* (protocol lookup, no default chain, duplicates, twelve half-wired shapes), EVM_* / Solana_* / TON_* / SUI_* / Replacement_* / Adapters_*,
     │                             # SettleBatchCalldata_* (cast golden, pinned selector, refusals), NewRun_* (cross-language golden root, refusals),
     │                             # PayBatchMessage_* (the bytes rule per batch, the pinned 300-run, the proof reaching the root, blockhash, dedup),
     │                             # TransferRequest_* (signing hash pinned against @ton/ton at 1 / 12 / 255, TEP-74 read-back, every ref aboard, the three rules, the 255 cut, refusals),
@@ -754,15 +792,22 @@ contracts/
 │       │   └── lib.rs            # init_run (escrow the total, pin the root), pay_batch (verify an aligned block, pay it), clawback
 │       └── tests/
 │           └── payout_run.rs     # BanksClient tests: the golden root, tamper / swap / partial-block rejections, the clawback line
-└── ton/                          # `make ton-test`: the Go-built W5 request against the real W5 wallet and real jetton contracts in @ton/sandbox
-    ├── package.json              # @ton/core, @ton/ton (the W5 code and the reference encoder), @ton/sandbox, func-js; every version pinned
-    ├── contracts/                # Vendored FunC sources, unmodified; UPSTREAM.md names the repositories and commits
-    │   ├── ft/                   # The TEP-74 reference jetton (ton-blockchain/token-contract)
-    │   └── usdt/                 # The jetton behind USDT on TON (ton-blockchain/stablecoin-contract)
-    ├── compile.mjs               # func-js: the four contracts into build/, code hashes printed
-    ├── lib.mjs                   # The bridge to backend/cmd/tondump
-    ├── golden.mjs                # The three pinned requests rebuilt with @ton/ton and compared byte for byte
-    └── e2e.mjs                   # Six scenarios: delivered at 3 (both jettons) and 255, refused (both), a locked USDT wallet; records testdata/tonsandbox/
+├── ton/                          # `make ton-test`: the Go-built W5 request against the real W5 wallet and real jetton contracts in @ton/sandbox
+│   ├── package.json              # @ton/core, @ton/ton (the W5 code and the reference encoder), @ton/sandbox, func-js; every version pinned
+│   ├── contracts/                # Vendored FunC sources, unmodified; UPSTREAM.md names the repositories and commits
+│   │   ├── ft/                   # The TEP-74 reference jetton (ton-blockchain/token-contract)
+│   │   └── usdt/                 # The jetton behind USDT on TON (ton-blockchain/stablecoin-contract)
+│   ├── compile.mjs               # func-js: the four contracts into build/, code hashes printed
+│   ├── lib.mjs                   # The bridge to backend/cmd/tondump
+│   ├── golden.mjs                # The three pinned requests rebuilt with @ton/ton and compared byte for byte
+│   └── e2e.mjs                   # Six scenarios: delivered at 3 (both jettons) and 255, refused (both), a locked USDT wallet; records testdata/tonsandbox/
+└── sui/
+    └── settlement/               # Move package (edition 2024, Sui framework only): the settlement rules on a chain where money is an object
+        ├── Move.toml             # Package manifest; Sui and MoveStdlib are the CLI's implicit dependencies, pinned in Move.lock
+        ├── sources/
+        │   └── settlement.move   # Book (per-payer replay guard), pay, Hold<T> (shared escrow), hold / release / refund / refund_expired, OperatorCap, the events
+        └── tests/
+            └── settlement_tests.move # test_scenario: pay, the guard, two books, the sponsor in the event, hold / release / refund, the window, the cap
 ```
 
 </details>
